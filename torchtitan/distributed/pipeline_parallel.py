@@ -1,0 +1,930 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+import copy
+import dataclasses
+import logging
+import math
+import os
+from collections.abc import Callable, Sequence
+from typing import Any, cast
+
+import torch
+import torch.nn as nn
+from torch.distributed._mesh_layout import _MeshLayout
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.schedules import (
+    _PipelineSchedule,
+    _PipelineScheduleRuntime,
+    BACKWARD_WEIGHT,
+    get_schedule_class,
+    PipelineScheduleMulti,
+    PipelineScheduleSingle,
+    ScheduleDualPipeV,
+    ScheduleZBVZeroBubble,
+)
+
+from torchtitan.components.loss import ChunkedLossWrapper, LossFunction
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.models.base.model import BaseModel
+from torchtitan.models.base.module import ModuleDict, ModuleList
+from torchtitan.models.common.decoder import Decoder
+
+logger = logging.getLogger(__name__)
+
+
+__all__ = [
+    "build_decoder_stage_io",
+    "DecoderStageIO",
+    "get_module_fqns_per_model_part",
+    "prepare_pipeline_schedule_for_accelerator_graph",
+    "pipeline_llm",
+    "pipeline_with_first_last_stage_modules",
+    "split_module",
+]
+
+
+def _build_get_mesh_callback(
+    parallelism_context: ParallelismContext,
+) -> Callable[[tuple[str, ...], _MeshLayout | None], DeviceMesh | None]:
+    """Build a callback that resolves a DeviceMesh from dimension names.
+
+    Pipeline parallelism requires an SPMD mesh during module split so that
+    at runtime the current PP rank can reconstruct a DTensor after receiving
+    a plain tensor from the previous PP rank. DTensors are not directly
+    serializable across PP stages (because ProcessGroup is not serializable),
+    so each stage uses this callback to obtain its local DeviceMesh and
+    re-wrap incoming tensors as DTensors with the correct placements.
+    """
+
+    def _get_mesh(
+        mesh_dim_names: tuple[str, ...], mesh_layout: _MeshLayout | None
+    ) -> DeviceMesh | None:
+        mesh = parallelism_context.get_mesh(list(mesh_dim_names))
+        if mesh_layout is not None and mesh._layout != mesh_layout:
+            return None
+        return mesh
+
+    return _get_mesh
+
+
+def pipeline_llm(
+    model: BaseModel,
+    *,
+    parallelism_context: ParallelismContext,
+    training: TrainingConfig,
+    precision: PrecisionConfig,
+    parallelism: ParallelismConfig,
+    local_compile: LocalCompileConfig,
+    activation_remat: ActivationRematConfig | None,
+    dump_folder: str,
+    device: torch.device,
+    model_config: BaseModel.Config,
+    loss_fn: LossFunction,
+) -> tuple[_PipelineSchedule, list[BaseModel], bool, bool]:
+    pp_mesh = parallelism_context.get_mesh("pp")
+
+    (
+        num_virtual_stages,
+        num_layers,
+        input_weight,
+        output_weight,
+    ) = _get_pipeline_metadata(parallelism_context, parallelism, model_config)
+
+    module_names_per_stage = parallelism.pipeline_parallel_module_fqns_per_model_part
+    if module_names_per_stage is None:
+        module_names_per_stage = _generate_llm_fqn_per_model_part(
+            num_virtual_stages, num_layers, input_weight, output_weight
+        )
+    for i, stage_ms in enumerate(module_names_per_stage):
+        logger.debug(f"Stage {i}: {stage_ms}")
+
+    stage_io = None
+    if torch.distributed.get_backend(pp_mesh.get_group("pp")) == "fake":
+        if not isinstance(model_config, Decoder.Config):
+            raise ValueError(
+                "Pipeline Parallel on a fake process group requires a Decoder "
+                f"model config, got {type(model_config).__qualname__}."
+            )
+        unsupported = _unsupported_static_split(module_names_per_stage)
+        if unsupported is not None:
+            raise ValueError(
+                "Pipeline Parallel on a fake process group requires static stage "
+                f"metadata, but {unsupported}. Split stage boundaries between "
+                "decoder blocks or use a real pipeline process group."
+            )
+        stage_io = build_decoder_stage_io(
+            parallelism_context=parallelism_context,
+            parallelism=parallelism,
+            training=training,
+            precision=precision,
+            model_config=model_config,
+            lm_head_in_loss=isinstance(loss_fn, ChunkedLossWrapper),
+        )
+
+    get_mesh_cb = _build_get_mesh_callback(parallelism_context)
+    stages, model_parts = _pipeline_module_split(
+        model,
+        pp_mesh,
+        parallelism.pipeline_parallel_schedule,
+        device,
+        module_names_per_stage,
+        get_mesh=get_mesh_cb,
+        stage_io=stage_io,
+    )
+
+    # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
+    # We need to iterate through model_parts to apply SPMD parallelisms, compilation,
+    # optimizer, and checkpointing
+    for i, m in enumerate(model_parts):
+        # apply SPMD-style PT-D techniques
+        m = m.parallelize(
+            parallelism_context=parallelism_context,
+            precision=precision,
+            parallelism=parallelism,
+            local_compile=local_compile,
+            activation_remat=activation_remat,
+            dump_folder=dump_folder,
+        )
+        model_parts[i] = m
+        # NOTE: this is to update the model in the stage
+        #       in case the model is modified e.g. by torch.compile
+        stages[i].submod = m
+
+    pp_schedule = _build_pipeline_schedule(
+        parallelism=parallelism,
+        num_microbatches=parallelism.num_pp_microbatches,
+        stages=stages,
+        loss_fn=loss_fn,
+    )
+    if _splits_backward(pp_schedule):
+        _disable_inplace_wgrad_accum(model_parts)
+
+    # This is used in the train loop to determine whether to pass in the input_ids and labels
+    has_first_stage = False
+    has_last_stage = False
+    for stage in stages:
+        if stage.is_first:
+            has_first_stage = True
+        if stage.is_last:
+            has_last_stage = True
+
+    return pp_schedule, model_parts, has_first_stage, has_last_stage
+
+
+def _splits_backward(schedule: _PipelineSchedule) -> bool:
+    """Whether ``schedule`` runs separate input- and weight-gradient passes.
+
+    Zero-bubble schedules (ZBVZeroBubble, DualPipeV, InterleavedZeroBubble, or a
+    custom one with W actions) do; 1F1B, Interleaved1F1B and GPipe run one full
+    backward per microbatch.
+    """
+    pipeline_order = getattr(schedule, "pipeline_order", None) or {}
+    return any(
+        action is not None and action.computation_type == BACKWARD_WEIGHT
+        for actions in pipeline_order.values()
+        for action in actions
+    )
+
+
+def _disable_inplace_wgrad_accum(model_parts: Sequence[nn.Module]) -> None:
+    """Turn off in-place WGRAD accumulation for a schedule that splits backward.
+
+    A split backward runs each microbatch's backward twice, an input-gradient
+    pass and a weight-gradient pass, both under autograd.grad(), where the
+    parameters' AccumulateGrad never runs. In-place accumulation adds into
+    ``weight.grad``, clears it and returns the buffer for AccumulateGrad to
+    reattach; in the input pass autograd.grad() discards that buffer, losing
+    the earlier microbatches' gradients. Full-backward schedules (1F1B,
+    Interleaved1F1B, GPipe) keep it: their microbatches add into the running
+    gradient while gradient sync is disabled.
+    """
+    num_disabled = 0
+    for model_part in model_parts:
+        for module in model_part.modules():
+            if getattr(module, "inplace_wgrad_accum", False):
+                # pyrefly: ignore [bad-argument-type]
+                module.inplace_wgrad_accum = False
+                num_disabled += 1
+    if num_disabled:
+        logger.info(
+            "The pipeline schedule splits backward into input and weight passes, "
+            f"so in-place WGRAD accumulation is off for {num_disabled} modules."
+        )
+
+
+def get_module_fqns_per_model_part(
+    model: BaseModel,
+    *,
+    first_stage_module_fqns: Sequence[str],
+    last_stage_module_fqns: Sequence[str],
+    parallelism_context: ParallelismContext,
+    parallelism: ParallelismConfig,
+    model_config: BaseModel.Config,
+) -> list[list[str]]:
+    """The auto-generated LLM split with the first- and last-stage modules pinned.
+
+    Each present module from ``first_stage_module_fqns`` is prepended to the first
+    part and each from ``last_stage_module_fqns`` appended to the last.
+    """
+    if parallelism.pipeline_parallel_module_fqns_per_model_part is not None:
+        raise ValueError(
+            "get_module_fqns_per_model_part derives the split, so "
+            "pipeline_parallel_module_fqns_per_model_part must be unset."
+        )
+    (
+        num_virtual_stages,
+        num_layers,
+        input_weight,
+        output_weight,
+    ) = _get_pipeline_metadata(parallelism_context, parallelism, model_config)
+    fqn_per_part = _generate_llm_fqn_per_model_part(
+        num_virtual_stages, num_layers, input_weight, output_weight
+    )
+
+    def get_present_modules(module_fqns: Sequence[str]) -> list[str]:
+        return [
+            module_fqn
+            for module_fqn in module_fqns
+            if getattr(model, module_fqn, None) is not None
+        ]
+
+    fqn_per_part[0][:0] = get_present_modules(first_stage_module_fqns)
+    fqn_per_part[-1].extend(get_present_modules(last_stage_module_fqns))
+    return fqn_per_part
+
+
+def pipeline_with_first_last_stage_modules(
+    model: BaseModel,
+    *,
+    first_stage_module_fqns: Sequence[str],
+    parallelism_context: ParallelismContext,
+    parallelism: ParallelismConfig,
+    model_config: BaseModel.Config,
+    last_stage_module_fqns: Sequence[str] = (),
+    **kwargs,
+) -> tuple[_PipelineSchedule, list[BaseModel], bool, bool]:
+    """Co-locate additional model modules with the first and last pipeline stages.
+
+    The auto-generated LLM stage split only knows about decoder modules
+    (``tok_embeddings``, ``layers.*``, ``norm``, ``lm_head``). This function
+    takes the split from ``get_module_fqns_per_model_part``, which pins each
+    present module from ``first_stage_module_fqns`` to the first stage and each
+    from ``last_stage_module_fqns`` to the last, before delegating to
+    ``pipeline_llm``. On other stages, the modules are pruned to ``None``; the
+    model's ``forward`` must tolerate that.
+
+    NOTE: This adds load to the end stages that the auto split does not model
+    (``input_weight`` only accounts for ``tok_embeddings``, ``output_weight``
+    for ``norm`` and ``lm_head``). Use
+    ``parallelism.pipeline_parallel_first_stage_less_layers`` and
+    ``pipeline_parallel_last_stage_less_layers`` to rebalance.
+    """
+    fqn_per_part = get_module_fqns_per_model_part(
+        model,
+        first_stage_module_fqns=first_stage_module_fqns,
+        last_stage_module_fqns=last_stage_module_fqns,
+        parallelism_context=parallelism_context,
+        parallelism=parallelism,
+        model_config=model_config,
+    )
+    # The caller's config is not touched.
+    parallelism = copy.copy(parallelism)
+    parallelism.pipeline_parallel_module_fqns_per_model_part = fqn_per_part
+    return pipeline_llm(
+        model,
+        parallelism_context=parallelism_context,
+        parallelism=parallelism,
+        model_config=model_config,
+        **kwargs,
+    )
+
+
+def _get_pipeline_metadata(
+    parallelism_context: ParallelismContext,
+    parallelism: ParallelismConfig,
+    model_config: BaseModel.Config,
+) -> tuple[int, int, int, int]:
+    """Determine the number of virtual stages and the number of layers in the model.
+
+    Extracted from ``pipeline_llm`` so that Graph PP can compute stage
+    metadata without running the full eager pipeline setup.
+    """
+    # Determine the number of virtual stages based on schedule type
+    schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+    is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
+    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
+    if hasattr(model_config, "layers"):
+        num_layers = len(model_config.layers)
+    else:
+        raise ValueError("Model does not have layers attribute.")
+
+    # You can adjust these weights based on the computational cost of embeddings and output layers
+    # Higher weights mean these modules are treated as "heavier" in the distribution
+    input_weight = parallelism.pipeline_parallel_first_stage_less_layers
+    output_weight = parallelism.pipeline_parallel_last_stage_less_layers
+
+    # Calculate number of virtual stages
+    if layers_per_stage is not None:
+        # Calculate number of virtual stages needed (using ceiling division)
+        # This allows for unequal distribution where stages can differ by at most 1 layer
+        num_virtual_stages = math.ceil(
+            (num_layers + input_weight + output_weight) / layers_per_stage
+        )
+
+        # Validation: check stages per rank based on schedule type
+        model_config_info = f"Model has {num_layers} layers with pipeline_parallel_layers_per_stage={layers_per_stage}"
+        stage_distribution_info = f"resulting in {num_virtual_stages=} across {parallelism_context.pp} PP ranks"
+
+        if num_virtual_stages % parallelism_context.pp != 0:
+            raise ValueError(
+                f"Number of virtual stages ({num_virtual_stages}) must be divisible by "
+                f"pipeline parallel size ({parallelism_context.pp}). "
+                f"{model_config_info}. "
+                f"Please adjust pipeline_parallel_layers_per_stage to a value that results in a number of stages "
+                f"divisible by {parallelism_context.pp}."
+            )
+
+        stages_per_rank = num_virtual_stages // parallelism_context.pp
+
+        if is_single_stage_schedule and stages_per_rank != 1:
+            raise ValueError(
+                f"Single stage schedule requires exactly 1 stage per rank, but got {stages_per_rank} stages per rank. "
+                f"{model_config_info}, {stage_distribution_info}. "
+                f"Please increase pipeline_parallel_layers_per_stage to {num_layers // parallelism_context.pp} or higher "
+                f"to achieve 1 stage per rank."
+            )
+
+        if not is_single_stage_schedule and stages_per_rank < 2:
+            raise ValueError(
+                f"Multi-stage schedule requires at least 2 stages per rank, but got {stages_per_rank} stages per rank. "
+                f"{model_config_info}, {stage_distribution_info}. "
+                f"Please decrease pipeline_parallel_layers_per_stage to achieve at least 2 stages per rank."
+            )
+    else:
+        # Fallback to default behavior when layers_per_stage is not provided
+        # For multi-stage schedules, default is 2 virtual stages per rank
+        # For single-stage schedules, default is 1 virtual stage per rank
+        stages_per_rank = 1 if is_single_stage_schedule else 2
+        num_virtual_stages = parallelism_context.pp * stages_per_rank
+    return num_virtual_stages, num_layers, input_weight, output_weight
+
+
+def prepare_pipeline_schedule_for_accelerator_graph(
+    schedule: _PipelineSchedule,
+    *,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    target: torch.Tensor | None,
+    loss_kwargs: dict[str, Any],
+    for_eval: bool = False,
+) -> None:
+    """Prepare training or eval pipeline metadata outside accelerator graph capture."""
+    # TODO: Use a public pipeline schedule initialization API.
+    if isinstance(schedule, PipelineScheduleSingle):
+        stages = [schedule._stage]
+        initialize = schedule._initialize_stage
+    else:
+        assert isinstance(schedule, PipelineScheduleMulti)
+        stages = schedule._stages
+        initialize = schedule._initialize_stages
+    has_backward = schedule._has_backward
+    schedule._has_backward = has_backward and not for_eval
+    try:
+        for stage in stages:
+            stage.has_backward = schedule._has_backward
+        initialize(args, kwargs, target, loss_kwargs=loss_kwargs)
+    finally:
+        schedule._has_backward = has_backward
+
+
+def _build_pipeline_schedule(
+    *,
+    parallelism: ParallelismConfig,
+    num_microbatches: int,
+    stages: list[PipelineStage],
+    loss_fn: Callable,
+    # Graph PP runs explicit backward graphs instead of autograd
+    backward_requires_autograd: bool = True,
+) -> _PipelineSchedule:
+    """Builds a pipeline schedule for the given job configuration and stages.
+
+    Also used by Graph PP, which passes ``backward_requires_autograd=False``
+    because it runs explicit backward graphs instead of autograd.
+
+    Args:
+        parallelism (ParallelismConfig): The parallelism configuration.
+        num_microbatches (int): Number of pipeline microbatches.
+        stages (list[PipelineStage]): The stages to be scheduled.
+        loss_fn (Callable): The loss function.
+
+    Returns:
+        _PipelineSchedule: The pipeline schedule for the given stages.
+    """
+    pp_schedule_csv = parallelism.pipeline_parallel_schedule_csv
+
+    # Validate that pp_schedule_csv is a valid path
+    if pp_schedule_csv:
+        if not os.path.isfile(pp_schedule_csv):
+            raise FileNotFoundError(
+                f"The specified path {pp_schedule_csv} does not exist or is not a file."
+            )
+        schedule_class = _PipelineScheduleRuntime
+    else:
+        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+
+    looped_schedule = issubclass(schedule_class, PipelineScheduleMulti)
+    # We expect that the number of local stages (`len(stages)`) is the same across all ranks
+    num_total_stages = parallelism.pipeline_parallel_degree * len(stages)
+    if num_microbatches < num_total_stages:
+        logger.warning(
+            f"Number of microbatches ({num_microbatches}) is less than the total number "
+            f"of stages ({num_total_stages}) which may result in a bubble in the pipeline."
+        )
+
+    if schedule_class is PipelineScheduleSingle:
+        raise ValueError(
+            "PipelineScheduleSingle is an abstract base class. "
+            "Use a concrete single-stage schedule such as GPipe or 1F1B."
+        )
+
+    # Pipeline schedules expect a bare scalar loss tensor. A caller that wants
+    # the loss metrics passes a per-microbatch ``loss_metrics`` dict, which is
+    # replaced rather than accumulated into: the schedule also calls the loss on
+    # the first microbatch while inferring stage metadata.
+    def _scalar_loss_fn(
+        *args: object,
+        loss_metrics: dict[str, torch.Tensor] | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        loss, metrics = loss_fn(*args, **kwargs)
+        if loss_metrics is not None:
+            loss_metrics.clear()
+            loss_metrics.update(metrics)
+        return loss
+
+    if looped_schedule:
+        schedule_kwargs: dict[str, Any] = {
+            "max_active_stages": (
+                parallelism.pp_max_unsharded_active_stages or len(stages)
+            ),
+            "unshard_lookahead": parallelism.pp_num_unshard_lookahead_factor,
+            # Graph PP owns gradient reduction through custom schedule actions.
+            "defer_reduce_grad_wait": backward_requires_autograd,
+            "max_outstanding_sends": (
+                parallelism.pipeline_parallel_max_outstanding_sends
+            ),
+        }
+        schedule = cast(Any, schedule_class)(
+            stages,
+            n_microbatches=num_microbatches,
+            loss_fn=_scalar_loss_fn,
+            scale_grads=False,
+            backward_requires_autograd=backward_requires_autograd,
+            **schedule_kwargs,
+        )
+    else:
+        if isinstance(parallelism.pp_num_unshard_lookahead_factor, tuple):
+            raise ValueError(
+                "Per-rank pp_num_unshard_lookahead_factor is supported only "
+                "by multi-stage pipeline schedules"
+            )
+        schedule = cast(Any, schedule_class)(
+            stages[0],
+            n_microbatches=num_microbatches,
+            loss_fn=_scalar_loss_fn,
+            scale_grads=False,
+        )
+    logger.info(
+        f"Using pipeline schedule {parallelism.pipeline_parallel_schedule} "
+        f"with {num_microbatches} microbatches and {num_total_stages} stages."
+    )
+
+    if pp_schedule_csv:
+        assert schedule_class in [
+            PipelineScheduleSingle,
+            PipelineScheduleMulti,
+            _PipelineScheduleRuntime,
+        ], (
+            "Only PipelineScheduleSingle (single stage), PipelineScheduleMulti (multistage), "
+            "and _PipelineScheduleRuntime support csv schedules"
+        )
+        schedule._load_csv(pp_schedule_csv)
+
+    # Chunked partial backwards preserve deferred-reduction policies during
+    # metadata inference, leaving unsharded gradients outside param.grad.
+    # TODO: Move this reset into PipelineStage's metadata cleanup.
+    # https://github.com/pytorch/pytorch/issues/203178
+    for stage in stages:
+        if isinstance(stage.submod, FSDPModule):
+            schedule.register_post_metadata_inference_cleanup(
+                stage.submod.reset_iter_state
+            )
+
+    return schedule
+
+
+def _generate_llm_fqn_per_model_part(
+    num_stages: int,
+    num_layers: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
+) -> list[list[str]]:
+    """Programmatically generates module names per model part, focused on LLM models.
+
+    Also used by Graph PP to compute per-stage module splits independently
+    of the full ``pipeline_llm`` setup.
+
+    Args:
+        num_stages: Number of pipeline stages
+        num_layers: Total number of transformer layers in the model
+        input_weight: Weight for input modules (tok_embeddings) in layer calculation
+        output_weight: Weight for output modules (norm + output) in layer calculation
+
+    Returns:
+        List of lists containing module names for each model part
+
+    Example:
+        _generate_llm_fqn_per_model_part(2, 3, input_weight=2, output_weight=2)
+        treats embeddings as 2 layers and norm+output as 2 layers for distribution
+    """
+    if num_stages < 1:
+        raise ValueError("Number of stages must be at least 1")
+
+    if num_stages == 1:
+        # Single stage gets everything
+        layer_names = [f"layers.{i}" for i in range(num_layers)]
+        return [["tok_embeddings"] + layer_names + ["norm", "lm_head"]]
+
+    # Calculate effective layers including weights
+    num_effective_layers = num_layers + input_weight + output_weight
+
+    if num_stages > num_effective_layers:
+        raise ValueError(
+            f"Number of stages ({num_stages}) cannot be greater than effective layers ({num_effective_layers})"
+        )
+
+    # Calculate layers per stage (distribute evenly)
+    layers_per_stage = num_effective_layers // num_stages
+    extra_layers = num_effective_layers % num_stages
+
+    # Feasibility check: Ensure at least 1 layer in each PP stage
+    if layers_per_stage == 0:
+        raise ValueError(
+            f"Configuration would result in empty stages. "
+            f"With {num_stages} stages and {num_effective_layers} effective layers "
+            f"(num_layers={num_layers} + input_weight={input_weight} + output_weight={output_weight}), "
+            f"each stage would get {layers_per_stage} layers on average. "
+            f"Reduce num_stages or increase num_layers/weights."
+        )
+
+    # Balance check: Ensure weights don't exceed minimum layers per stage
+    if input_weight > layers_per_stage:
+        raise ValueError(
+            f"input_weight ({input_weight}) exceeds minimum layers per stage ({layers_per_stage})."
+        )
+    if output_weight > layers_per_stage:
+        raise ValueError(
+            f"output_weight ({output_weight}) exceeds minimum layers per stage ({layers_per_stage})."
+        )
+
+    module_names_per_stage = []
+    current_layer = 0
+
+    for stage_idx in range(num_stages):
+        stage_modules = []
+
+        # Calculate effective layers for this stage
+        effective_layers_for_stage = layers_per_stage
+        if stage_idx < extra_layers:
+            effective_layers_for_stage += 1
+
+        # First stage: handle input modules with weighting
+        if stage_idx == 0:
+            stage_modules.append("tok_embeddings")
+            # Account for input weight in layer distribution
+            remaining_layers_for_stage = effective_layers_for_stage - input_weight
+
+            # Add transformer layers
+            for _ in range(remaining_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+        # Last stage: handle output modules with weighting
+        elif stage_idx == num_stages - 1:
+            # Account for output weight in layer distribution
+            remaining_layers_for_stage = effective_layers_for_stage - output_weight
+
+            # Add transformer layers
+            for _ in range(remaining_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+            # Add output modules
+            stage_modules.extend(["norm", "lm_head"])
+
+        # Middle stages: only transformer layers
+        else:
+            for _ in range(effective_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+        module_names_per_stage.append(stage_modules)
+
+    return module_names_per_stage
+
+
+def split_module(
+    whole_model: BaseModel,
+    module_names: list[str],
+) -> BaseModel:
+    """
+    Splits a whole model into a module based on the specified module names.
+
+    Args:
+        whole_model: The complete model to be split
+        module_names: List of module names to include in the split
+
+    Returns:
+        The split module
+
+    Example usage:
+        module_names = ["tok_embeddings", "layers.0", "layers.1", "norm", "output"]
+        split_module(whole_model, module_names)
+    """
+    model = copy.deepcopy(whole_model)
+    # Create a set of modules to keep for faster lookup
+    modules_to_keep = set(module_names)
+    for module_name, module_value in model.named_children():
+        # Handle layer-like structures (e.g., "layers.0", "layers.1")
+        if isinstance(
+            module_value, (nn.ModuleDict, nn.ModuleList, ModuleDict, ModuleList)
+        ):
+            layers_to_keep = {
+                name.split(".", 1)[1]
+                for name in modules_to_keep
+                if name.startswith(f"{module_name}.")
+            }
+            if layers_to_keep:
+                # Keep only specified layers
+                if isinstance(module_value, nn.ModuleDict):
+                    for layer_name in list(module_value.keys()):
+                        if layer_name not in layers_to_keep:
+                            del module_value[layer_name]
+                elif isinstance(module_value, nn.ModuleList):
+                    indices_to_keep = {
+                        int(idx) for idx in layers_to_keep if idx.isdigit()
+                    }
+                    new_layers = ModuleList(
+                        [
+                            layer
+                            for i, layer in enumerate(module_value)
+                            if i in indices_to_keep
+                        ]
+                    )
+                    setattr(model, module_name, new_layers)
+            else:
+                # No layers from this structure needed, set to empty structure
+                if isinstance(module_value, (nn.ModuleDict, ModuleDict)):
+                    setattr(model, module_name, ModuleDict())
+                elif isinstance(module_value, (nn.ModuleList, ModuleList)):
+                    setattr(model, module_name, ModuleList())
+        # Handle simple module attributes (e.g., "linear", "norm")
+        elif module_name not in modules_to_keep:
+            # Replace with None
+            setattr(model, module_name, None)
+    return model
+
+
+def _get_pp_rank_to_stage_indices_mapping(
+    pp_rank: int,
+    pp_degree,
+    pp_schedule: str,
+    num_stages: int,
+) -> tuple[int, ...]:
+    """
+    Returns a mapping from PP rank to stage indices for the given pipeline schedule.
+
+    Args:
+        pp_rank: Pipeline parallel rank
+        pp_degree: Number of pipeline parallel ranks
+        pp_schedule: Name of pipeline parallelism schedule
+        num_stages: Number of pipeline stages
+
+    Returns:
+        Mapping from PP rank to stage indices
+    """
+    schedule_class = get_schedule_class(pp_schedule)
+    style = (
+        "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
+    )
+    assert (
+        num_stages % pp_degree == 0
+    ), f"num_stages {num_stages} must be evenly divisible by pp_degree {pp_degree}"
+    stages_per_rank = num_stages // pp_degree
+    if style == "loop":
+        return tuple(pp_rank + s * pp_degree for s in range(stages_per_rank))
+    elif style == "v":
+        assert (
+            stages_per_rank == 2
+        ), f"v schedules assume 2 stages per rank, got {stages_per_rank}"
+        stage_v_pairs = list(
+            zip(range(pp_degree), range(num_stages - 1, pp_degree - 1, -1))
+        )
+        return tuple(stage_v_pairs[pp_rank])
+    else:
+        raise ValueError(f"Unknown style {style}")
+
+
+@dataclasses.dataclass(frozen=True)
+class DecoderStageIO:
+    """Example tensors describing decoder pipeline boundaries."""
+
+    decoder_input: torch.Tensor
+    hidden: torch.Tensor
+    decoder_output: torch.Tensor
+
+
+def _unsupported_static_split(
+    module_names_per_stage: list[list[str]],
+) -> str | None:
+    """Return why one hidden-state description cannot represent this split."""
+    for stage_idx in range(len(module_names_per_stage) - 1):
+        before = module_names_per_stage[stage_idx]
+        after = module_names_per_stage[stage_idx + 1]
+        output_module = before[-1] if before else ""
+        input_module = after[0] if after else ""
+        if not (
+            output_module in {"tok_embeddings", "norm"}
+            or output_module.startswith("layers.")
+        ):
+            return f"stage {stage_idx} does not produce decoder hidden states"
+        if not (
+            input_module in {"norm", "lm_head"} or input_module.startswith("layers.")
+        ):
+            return f"stage {stage_idx + 1} does not consume decoder hidden states"
+    return None
+
+
+def build_decoder_stage_io(
+    *,
+    parallelism_context: ParallelismContext,
+    parallelism: ParallelismConfig,
+    training: TrainingConfig,
+    precision: PrecisionConfig,
+    model_config: Decoder.Config,
+    lm_head_in_loss: bool,
+) -> DecoderStageIO:
+    """Build static metadata for tensors crossing decoder stage boundaries."""
+    cp_shards = parallelism_context.cp
+    num_tokens, cp_remainder = divmod(
+        training.num_tokens_per_microbatch_per_dp_rank, cp_shards
+    )
+    if cp_remainder:
+        raise ValueError(
+            "Static pipeline metadata requires the microbatch token count to "
+            f"be divisible by the CP partition count ({cp_shards})."
+        )
+
+    hidden_tokens = num_tokens
+    if parallelism_context.tp_enabled and parallelism.enable_sequence_parallel:
+        hidden_tokens, tp_remainder = divmod(num_tokens, parallelism_context.tp)
+        if tp_remainder:
+            raise ValueError(
+                "Static pipeline metadata requires the CP-local token count to "
+                f"be divisible by TP ({parallelism_context.tp}) with sequence parallelism."
+            )
+
+    dtype = TORCH_DTYPE_MAP[precision.param_dtype]
+
+    def example(*shape: int, dtype: torch.dtype = dtype) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    hidden = example(hidden_tokens, model_config.dim).requires_grad_()
+    if lm_head_in_loss:
+        decoder_output = example(num_tokens, model_config.dim)
+    else:
+        local_vocab_size = model_config.vocab_size
+        if parallelism_context.tp_enabled:
+            tp_rank = parallelism_context.get_mesh("tp").get_local_rank()
+            local_vocab_size, remainder = divmod(
+                model_config.vocab_size, parallelism_context.tp
+            )
+            local_vocab_size += tp_rank < remainder
+        decoder_output = example(num_tokens, local_vocab_size)
+
+    return DecoderStageIO(
+        decoder_input=example(num_tokens, dtype=torch.int64),
+        hidden=hidden,
+        decoder_output=decoder_output.requires_grad_(),
+    )
+
+
+def _static_stage_metadata(
+    stage_io: DecoderStageIO,
+    stage_idx: int,
+    num_stages: int,
+) -> dict[str, Any]:
+    """Return complete static metadata for one ``PipelineStage``."""
+    is_first = stage_idx == 0
+    is_last = stage_idx == num_stages - 1
+    hidden_grad = stage_io.hidden.detach()
+    return {
+        "input_args": (stage_io.decoder_input if is_first else stage_io.hidden,),
+        "output_args": (stage_io.decoder_output if is_last else stage_io.hidden,),
+        # A tuple containing None is explicit no-gradient metadata. Bare None
+        # means unknown metadata and would re-enable dynamic inference.
+        "input_grads": (None,) if is_first else (hidden_grad,),
+        "output_grads": (None,) if is_last else (hidden_grad,),
+    }
+
+
+def _pipeline_module_split(
+    whole_model: BaseModel,
+    pp_mesh: DeviceMesh,
+    pp_schedule: str,
+    device: torch.device,
+    module_names_per_stage: list[list[str]],
+    get_mesh: Callable | None = None,
+    stage_io: DecoderStageIO | None = None,
+) -> tuple[list[PipelineStage], list[BaseModel]]:
+    """Create pipeline stages based on specified module names for each stage.
+
+    Also used by Graph PP to split the model into per-stage chunks before
+    exporting joint forward/backward graphs for each stage.
+
+    Some model restrictions include:
+    - forward() method should tolerate deleted layers
+    - weight initialization methods should tolerate deleted layers
+    - Does not support nested moduledict and modulelist structures
+
+    Args:
+        whole_model: The complete model to be split
+        pp_mesh: Pipeline parallel device mesh
+        pp_schedule: Name of pipeline parallelism schedule
+        device: Device
+        module_names_per_stage: List of lists, where each inner list contains the module names
+                               that should be included in that stage. Module names should be
+                               dot-separated paths. Examples:
+                               - "tok_embeddings" for token embeddings
+                               - "layers.0", "layers.1" for specific transformer layers
+                               - "norm" for the final normalization layer
+                               - "lm_head" for the output projection layer
+        get_mesh: Callback used to reconstruct DTensor inputs after PP receives.
+        stage_io: Static tensors describing decoder stage boundaries. Fake PP
+            requires these because it cannot exchange metadata dynamically.
+
+    Returns:
+        Tuple of (stages, models) where stages are PipelineStage objects and models are the
+        corresponding model chunks
+
+    Example usage:
+        module_names_per_stage = [
+            ["tok_embeddings", "layers.0"],     # Stage 0: embeddings + first layer
+            ["layers.1", "layers.2"],           # Stage 1: middle layers
+            ["norm", "lm_head"]                  # Stage 2: final norm + output
+        ]
+    """
+    pp_rank = pp_mesh.get_local_rank()
+    pp_degree = pp_mesh.size()
+    num_stages = len(module_names_per_stage)
+    stages = []
+    models = []
+    pp_rank_to_stage_indices = _get_pp_rank_to_stage_indices_mapping(
+        pp_rank, pp_degree, pp_schedule, num_stages
+    )
+    for stage_idx in pp_rank_to_stage_indices:
+        module_names = module_names_per_stage[stage_idx]
+        model_chunk = split_module(whole_model, module_names)
+        stage = PipelineStage(
+            model_chunk,
+            stage_idx,
+            num_stages,
+            device,
+            group=pp_mesh.get_group("pp"),
+            get_mesh=get_mesh,
+            **(
+                _static_stage_metadata(stage_io, stage_idx, num_stages)
+                if stage_io is not None
+                else {}
+            ),
+        )
+        logger.info(
+            f"PP rank {pp_rank} is building stage_idx {stage_idx} "
+            f"with modules {module_names}"
+        )
+        stages.append(stage)
+        models.append(model_chunk)
+
+    return stages, models

@@ -1,0 +1,79 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import logging
+from typing import cast
+
+import torch
+from torch.distributed.elastic.multiprocessing.errors import record
+
+from torchtitan.config import ConfigLoader
+from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.logging import init_logger
+from torchtitan.trainer import Trainer
+
+
+logger = logging.getLogger(__name__)
+
+
+# On main(), not Trainer methods, so config loading and seed-checkpoint errors
+# also reach the torchelastic error file.
+@record
+def main() -> None:
+    """Main entry point for training."""
+    init_logger()
+
+    import torchtitan
+
+    logger.info(
+        "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
+        torchtitan.__version__,
+    )
+
+    config = cast(Trainer.Config, ConfigLoader().load())
+
+    # NOTE: internal meta tooling relies on source="training".
+    sl.init_structured_logger(
+        source="training",
+        output_dir=config.dump_folder,
+        enable=config.debug.enable_structured_logging,
+    )
+    sl.log_trace_instant("structured_logger_started")
+
+    trainer: Trainer | None = None
+
+    try:
+        trainer = config.build()
+
+        if config.create_seed_checkpoint:
+            world_size = trainer.engine.parallelism_context.world_size
+            if world_size != 1:
+                raise ValueError(
+                    "Must create a seed checkpoint using a single device, to "
+                    f"disable sharding. Got world size {world_size}."
+                )
+            trainer.engine.save_checkpoint(last_step=True)
+            logger.info("Created seed checkpoint")
+        else:
+            trainer.train()
+    except Exception:
+        if trainer:
+            try:
+                trainer.close()
+            except Exception:
+                # Keep the original failure as the recorded root cause.
+                logger.exception("trainer.close() failed during error cleanup")
+        raise
+    else:
+        trainer.close()
+        if torch.distributed.is_initialized():
+            with sl.log_trace_span("torch_distributed_teardown"):
+                torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,584 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
+from typing import Any
+
+import spmd_types as spmd
+import torch
+from spmd_types import SpmdType
+
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.models.base.model import BaseModel, FlopsEstimator
+from torchtitan.models.base.module import Module, ModuleDict
+from torchtitan.models.common.attention import (
+    Attention,
+    AttentionMetadata,
+    AttentionMetadataMap,
+    InnerAttention,
+    SlidingWindowFlexInnerAttention,
+    SlidingWindowVarlenInnerAttention,
+)
+from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.common.embedding import VocabParallelEmbedding
+from torchtitan.models.common.feed_forward import DenseFeedForward, FeedForward
+from torchtitan.models.common.flops import (
+    active_parameter_flops_per_token,
+    get_parameter_counts,
+)
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.rope import RoPE
+from torchtitan.observability.logging import warn_once
+
+__all__ = ["Decoder", "TransformerBlock"]
+
+logger = logging.getLogger(__name__)
+
+
+# TODO: we can unify the TransformerBlock impl across all models when
+# there is no special logic for each model.
+class TransformerBlock(Module):
+    """Base class for all language model transformer blocks.
+
+    All language model TransformerBlocks share:
+    - Attention module (from ``attention.build()``)
+    - Dense or MoE feed-forward module (from ``feed_forward.build()``)
+    - Two normalization modules (``attention_norm``, ``ffn_norm``)
+
+    Forward accepts ``aux_loss_denominator``. Dense blocks ignore it; MoE
+    blocks pass it to routers configured with an auxiliary loss.
+
+    Children implement ``__init__``, ``forward``, and residual connections.
+    """
+
+    attention: Attention
+    feed_forward: FeedForward
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        attention: Attention.Config  # required, no default
+        feed_forward: FeedForward.Config
+        attention_norm: Module.Config
+        ffn_norm: Module.Config
+
+
+class Decoder(BaseModel):
+    """Base class for autoregressive decoder-only language models.
+
+    Provides shared ``__init__``, ``forward``, ``init_states``, and
+    ``_get_attention_metadata`` (flex/varlen dispatch) used by most models.
+    """
+
+    layers: ModuleDict[TransformerBlock]
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseModel.Config):
+        dim: int
+        vocab_size: int
+        lm_head: Linear.Config
+        tok_embeddings: VocabParallelEmbedding.Config
+        norm: RMSNorm.Config
+        layers: list[TransformerBlock.Config]
+        # Tie ``tok_embeddings`` and ``lm_head`` to share one weight. Models
+        # that support it set this True in their config factories; the tying
+        # itself is handled by ``Decoder.__init__``, ``Decoder._parallelize``
+        # and ``Decoder.init_states``.
+        enable_weight_tying: bool = False
+
+        def __post_init__(self) -> None:
+            if self.enable_weight_tying:
+                # From ``_parallelize`` on, tok_embeddings uses lm_head's
+                # distributed weight, so both must declare the same layout.
+                embedding_layout, lm_head_layout = (
+                    None
+                    if module_config.sharding_config is None
+                    else module_config.sharding_config.state_shardings.get("weight")
+                    for module_config in (self.tok_embeddings, self.lm_head)
+                )
+                if embedding_layout != lm_head_layout:
+                    raise ValueError(
+                        "enable_weight_tying requires tok_embeddings and lm_head "
+                        "to declare the same weight sharding, got "
+                        f"{embedding_layout} and {lm_head_layout}."
+                    )
+            sliding_window_sizes: dict[type[InnerAttention], int] = {}
+            for layer_config in self.layers:
+                for _, attention, _, _ in layer_config.traverse(Attention.Config):
+                    config = attention.inner_attention
+                    if not isinstance(
+                        config,
+                        (
+                            SlidingWindowFlexInnerAttention.Config,
+                            SlidingWindowVarlenInnerAttention.Config,
+                        ),
+                    ):
+                        continue
+                    backend = config._owner
+                    assert backend is not None and issubclass(backend, InnerAttention)
+                    window_size = sliding_window_sizes.setdefault(
+                        backend, config.sliding_window_size
+                    )
+                    if window_size != config.sliding_window_size:
+                        raise ValueError(
+                            f"{backend.__name__} layers must use the same "
+                            "sliding_window_size because they share attention metadata."
+                        )
+
+        @property
+        def first_full_attention(self) -> Attention.Config | None:
+            """First full-attention config, including causal attention, else None."""
+            return next(
+                (
+                    layer.attention
+                    for layer in self.layers
+                    if layer.attention.inner_attention.is_full_attention
+                ),
+                None,
+            )
+
+        @property
+        def first_feed_forward(self) -> DenseFeedForward.Config | None:
+            """First dense feed-forward config, else None."""
+            return next(
+                (
+                    layer.feed_forward
+                    for layer in self.layers
+                    if isinstance(layer.feed_forward, DenseFeedForward.Config)
+                ),
+                None,
+            )
+
+        @property
+        def first_moe(self) -> MoE.Config | None:
+            """First mixture-of-experts config, else None."""
+            return next(
+                (config for _, config, _, _ in self.traverse(MoE.Config)),
+                None,
+            )
+
+        def get_parameter_counts(self, model: Module) -> tuple[int, int]:
+            """Return total and architecturally active native decoder parameters."""
+            return get_parameter_counts(model)
+
+        def build_flops_estimator(
+            self,
+            model: Module,
+            *,
+            seq_len: int,
+            excluded_submodules: tuple[Module | None, ...] = (),
+        ) -> FlopsEstimator:
+            # Attention cost comes from each microbatch's document positions.
+            del seq_len
+            parameter_flops_per_token = active_parameter_flops_per_token(
+                model, excluded_submodules=excluded_submodules
+            )
+
+            def equal_ignoring_param_init(a: object, b: object) -> bool:
+                # Layers often differ only in depth-scaled param_init, which
+                # does not change FLOPs.
+                if is_dataclass(a) and type(a) is type(b):
+                    return all(
+                        field.name == "param_init"
+                        or equal_ignoring_param_init(
+                            getattr(a, field.name), getattr(b, field.name)
+                        )
+                        for field in fields(a)
+                    )
+                return a == b
+
+            # Layers repeat a few attention configs; count each distinct one once.
+            attention_counts: list[tuple[Attention.Config, int]] = []
+            for _, attention, _, _ in self.traverse(Attention.Config):
+                for i, (seen, count) in enumerate(attention_counts):
+                    if equal_ignoring_param_init(seen, attention):
+                        attention_counts[i] = (seen, count + 1)
+                        break
+                else:
+                    attention_counts.append((attention, 1))
+
+            def estimate(input_dict: Mapping[str, Any]) -> int:
+                # Padding does no useful work, so it is not counted.
+                positions = input_dict["positions"][~input_dict["padding_mask"]]
+                return parameter_flops_per_token * positions.numel() + sum(
+                    count * attention.flops(positions)
+                    for attention, count in attention_counts
+                )
+
+            return estimate
+
+    # Set by the trainer when ChunkedLossWrapper is used, so lm_head is applied
+    # per-chunk inside the loss function instead of in forward().
+    # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor
+    # inputs (bool kwargs cause 'has no attribute requires_grad' errors).
+    _skip_lm_head: bool = False
+
+    def _apply_fsdp(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        precision: PrecisionConfig,
+        parallelism: ParallelismConfig,
+    ) -> None:
+        from torchtitan.distributed.fsdp import (
+            apply_fsdp_to_decoder,
+            resolve_fsdp_mesh,
+            resolve_sparse_fsdp_mesh,
+        )
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        apply_fsdp_to_decoder(
+            self,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
+            pp_enabled=parallelism_context.pp_enabled,
+            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallelism_context.ep,
+            edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            unshard_in_current_stream=parallelism.fsdp_unshard_in_current_stream,
+        )
+
+    def __init__(self, config: Config):
+        from torchtitan.distributed.spmd_types import spmd_mesh_size, spmd_sparse_mesh
+
+        tp = spmd_mesh_size("tp")
+        attention = config.first_full_attention
+        if tp > 1 and attention is not None:
+            num_heads = attention.n_heads
+            num_kv_heads = getattr(attention, "n_kv_heads", None) or num_heads
+            if num_heads % tp != 0:
+                raise ValueError(
+                    f"tensor parallel degree ({tp}) must divide "
+                    f"n_heads ({num_heads})."
+                )
+            # Fused QKV projections shard whole KV-head groups. Attention with
+            # separate K/V projections may instead shard each head's features.
+            if hasattr(attention, "qkv_linear") and num_kv_heads % tp != 0:
+                raise ValueError(
+                    f"tensor parallel degree ({tp}) must divide "
+                    f"n_kv_heads ({num_kv_heads})."
+                )
+
+        sparse_mesh = spmd_sparse_mesh()
+        ep = sparse_mesh["ep"].size() if sparse_mesh is not None else 1
+        moe_configs = list(config.traverse(MoE.Config))
+        if moe_configs and ep < tp:
+            raise ValueError(
+                f"MoE models require expert parallel degree ({ep}) to be "
+                f"greater than or equal to tensor parallel degree ({tp})."
+            )
+        for moe_fqn, moe, _, _ in moe_configs:
+            if moe.num_experts % ep != 0:
+                raise ValueError(
+                    f"{moe_fqn}.num_experts ({moe.num_experts}) must be "
+                    f"divisible by expert parallel degree ({ep})."
+                )
+
+        super().__init__()
+        self.config = config
+
+        self.tok_embeddings = config.tok_embeddings.build()
+
+        self.layers = ModuleDict()
+        for i, layer_config in enumerate(config.layers):
+            self.layers[str(i)] = layer_config.build()
+
+        self.norm = config.norm.build()
+        self.lm_head = config.lm_head.build()
+
+        self.enable_weight_tying = config.enable_weight_tying
+        if self.enable_weight_tying:
+            self.tok_embeddings.weight = self.lm_head.weight
+
+        self._tie_rope_caches()
+
+    def _parallelize(self, parallelism_context: ParallelismContext) -> None:
+        super()._parallelize(parallelism_context)
+        if self.enable_weight_tying:
+            # Distributing states registers a new Parameter in each module,
+            # which unties the weights. Tie them again before FSDP groups the
+            # tied modules, so it shards and communicates one parameter.
+            self.tok_embeddings.weight = self.lm_head.weight
+        # Share the RoPE caches again too, for code that runs before init_states.
+        self._tie_rope_caches()
+
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        if self.enable_weight_tying:
+            # Re-tie before init: a data parallel wrapper that registers new
+            # parameters after ``_parallelize`` (e.g. GraphTrainer's SimpleFSDP)
+            # unties the weights again, and ``tok_embeddings.weight`` is skipped
+            # by ``skip_param_init``, so re-point it at the initialized lm_head
+            # weight.
+            assert self.tok_embeddings is not None and self.lm_head is not None
+            self.tok_embeddings.weight = self.lm_head.weight
+        super().init_states(buffer_device=buffer_device)
+        # ``to_empty()`` and ``RoPE._init_self_buffers()`` give every layer its
+        # own cache again; point identical RoPEs back at one tensor.
+        self._tie_rope_caches()
+
+    def _tie_rope_caches(self) -> None:
+        """Share one cache tensor across RoPE modules with equal configs.
+
+        Every attention layer builds its own ``(max_context_length, ...)`` fp32
+        RoPE cache, identical across layers with the same config; at long
+        context these add up to GiBs per rank. The cache is a non-persistent,
+        read-only buffer, so sharing it does not change numerics or checkpoints.
+
+        Sharing only holds after ``init_states``: any later ``_apply`` (e.g.
+        ``model.to(...)``) gives every RoPE its own copy again. That costs
+        memory but not correctness.
+        """
+        # TODO: this lowers steady-state memory only. ``to_empty()`` and each
+        # ``RoPE._init_self_buffers()`` still materialize one cache per RoPE
+        # before they are tied here. If init-time peak memory becomes a problem,
+        # have ``_init_self_buffers`` reuse a cache already built for an equal
+        # config during the same ``init_states`` pass.
+        representatives: list[RoPE] = []
+        for module in self.modules():
+            if not isinstance(module, RoPE):
+                continue
+            rep = next(
+                (
+                    r
+                    for r in representatives
+                    if type(r) is type(module) and r.config == module.config
+                ),
+                None,
+            )
+            if rep is None:
+                representatives.append(module)
+            else:
+                module.cache = rep.cache
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_metadata: AttentionMetadataMap | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ):
+        # positions is listed before attention_metadata so AutoParallel's input_fn,
+        # which returns (tokens, positions) and binds them positionally, maps
+        # positions to the right parameter (it would otherwise land in the
+        # attention_metadata slot and break the maskless SDPA backend).
+        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        return self.forward_embeddings(
+            h,
+            positions,
+            attention_metadata,
+            padding_mask=padding_mask,
+            aux_loss_denominators=aux_loss_denominators,
+        )
+
+    def forward_embeddings(
+        self,
+        h: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_metadata: AttentionMetadataMap | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ):
+        """`forward` after the token embedding: the layers, the final norm and the LM head
+        (unless ``_skip_lm_head``). For callers that build the input embeddings
+        themselves, e.g. the RL generator merging image embeddings into a prompt."""
+        with spmd.no_typecheck():
+            aux_loss_denominator = (
+                None if aux_loss_denominators is None else aux_loss_denominators[0]
+            )
+        for layer in self.layers.values():
+            layer_attention_metadata = (
+                None
+                if attention_metadata is None
+                else attention_metadata.get(type(layer.attention.inner_attention))
+            )
+            h = layer(
+                h,
+                layer_attention_metadata,
+                positions,
+                padding_mask=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
+
+        h = self._pre_lm_head_norm_and_gather(h)
+
+        # _skip_lm_head is an attribute rather than a forward kwarg because PP backward
+        # calls .requires_grad on all stage inputs, which fails on bool kwargs.
+        # TODO: fix PP backward upstream to skip non-tensor inputs
+        if self._skip_lm_head:
+            return h
+        output = self.lm_head(h) if self.lm_head is not None else h
+        return output
+
+    def _pre_lm_head_norm_and_gather(self, h: torch.Tensor) -> torch.Tensor:
+        """Apply the root norm and gather its output to TP-``Replicate``.
+
+        The vocab-sharded ``lm_head`` needs the full hidden states on every TP
+        rank. The gather runs once here, after the norm, rather than inside
+        ``lm_head``, which ``ChunkedLossWrapper`` calls once per chunk.
+        Pipeline stages without the root norm return ``h`` unchanged.
+
+        TODO: issue the gather from its consumer instead: inside ``lm_head``
+        (a column-parallel linear), with ``ChunkedLossWrapper`` gathering once
+        before it chunks.
+        """
+        if self.norm is None:
+            return h
+        return maybe_gather_tp_input(self.norm, self.norm(h))
+
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, Any],
+        *,
+        parallelism_context: ParallelismContext,
+        parallelism: ParallelismConfig,
+        max_num_documents: int | None = None,
+        global_routing_token_counts: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, ...],
+        torch.Tensor | tuple[torch.Tensor, ...],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        """Build masks (flex/varlen), CP-shard, SPMD-wrap, and return the batch."""
+        del kwargs
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
+        positions = input_dict.get("positions", None)
+        padding_mask = input_dict.get("padding_mask", None)
+        if positions is not None:
+            attention_metadata = self._get_attention_metadata(
+                positions=positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+            )
+            input_dict["attention_metadata"] = attention_metadata
+
+        input_shardings = decoder_input_sharding()
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
+        if parallelism_context.cp_enabled:
+            input_dict = self._cp_shard(
+                input_dict,
+                input_shardings=input_shardings,
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
+            )
+        input_dict = annotate_input_spmd_types(
+            parallelism_context, input_dict, input_shardings
+        )
+
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
+        inputs = input_dict.pop("input")
+        labels = input_dict.pop("labels")
+        if next(self.config.traverse(AuxLoss.Config), None) is not None:
+            input_dict["aux_loss_denominators"] = global_routing_token_counts
+        return inputs, labels, input_dict, loss_kwargs
+
+    def _cp_shard(
+        self,
+        input_dict: dict[str, Any],
+        input_shardings: dict[str, SpmdType],
+        parallelism_context: ParallelismContext,
+        parallelism: ParallelismConfig,
+    ) -> dict[str, Any]:
+        """Prepare attention metadata and shard model inputs for CP."""
+        from torchtitan.distributed import context_parallel
+        from torchtitan.models.common.attention.cp_attention import CPInnerAttention
+
+        attention_metadata = input_dict.get("attention_metadata")
+        load_balancer_config = parallelism.context_parallel_load_balancer
+        load_balancer = None
+        if load_balancer_config is not None:
+            # All PP stages retain the full model config and share one permutation.
+            attention = self.config.first_full_attention
+            if attention is None:
+                warn_once(
+                    logger,
+                    "Ignoring context_parallel_load_balancer because the model "
+                    "has no full attention. Using contiguous CP sharding.",
+                )
+            else:
+                selected_attention_metadata = None
+                if attention_metadata is not None:
+                    cp_inner_attention = attention.inner_attention._owner
+                    assert cp_inner_attention is not None and issubclass(
+                        cp_inner_attention, CPInnerAttention
+                    )
+                    selected_attention_metadata = attention_metadata.get(
+                        cp_inner_attention
+                    )
+                load_balancer = load_balancer_config.build(
+                    seq_len=context_parallel.get_cp_input_seq_len(
+                        input_dict, input_shardings=input_shardings
+                    ),
+                    attention_metadata=selected_attention_metadata,
+                )
+        permutation = (
+            load_balancer.generate_permutation() if load_balancer is not None else None
+        )
+        if "attention_metadata" in input_dict:
+            attention_metadata = input_dict["attention_metadata"]
+            assert isinstance(attention_metadata, dict)
+            for inner_attention, metadata in attention_metadata.items():
+                if not issubclass(inner_attention, CPInnerAttention):
+                    continue
+                attention_metadata[
+                    inner_attention
+                ] = inner_attention.prepare_cp_metadata(
+                    metadata,
+                    permutation=permutation,
+                )
+        return context_parallel.shard_tensors(
+            input_dict,
+            input_shardings=input_shardings,
+            permutation=permutation,
+        )
+
+    def _get_attention_metadata(
+        self,
+        positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+    ) -> AttentionMetadataMap:
+        attention_metadata: dict[type[InnerAttention], AttentionMetadata] = {}
+        for layer_config in self.config.layers:
+            for _, attention, _, _ in layer_config.traverse(Attention.Config):
+                config = attention.inner_attention
+                backend = config._owner
+                assert backend is not None and issubclass(backend, InnerAttention)
+                if backend in attention_metadata:
+                    continue
+                metadata = config.build_attention_metadata(
+                    positions,
+                    padding_mask=padding_mask,
+                    max_num_documents=max_num_documents,
+                    max_context_length=self.config.max_context_length,
+                )
+                if metadata is not None:
+                    attention_metadata[backend] = metadata
+        return attention_metadata

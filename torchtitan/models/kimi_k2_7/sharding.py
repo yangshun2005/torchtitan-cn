@@ -1,0 +1,52 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Sharding configs for Kimi K2.5 (MoonViT3d + DeepSeekV3).
+
+Declarations only: ``flavors.py`` sets these on each sub-config as it builds
+it, and ``model.parallelize()`` applies TP/EP/SP through the Module protocol.
+
+- Decoder (MLA + MoE): built with DeepSeek V3's sharded layer builder.
+  Multimodal models gather the token embeddings to ``Replicate`` before the
+  vision scatter and restore the residual layout after it.
+- Vision encoder: activations flow ``Invariant`` (no SP -- the patch sequence is
+  short, so sequence-sharding would add gather/scatter around the block-diagonal
+  attention for little memory gain). Only the linear layers are Colwise/Rowwise
+  sharded for memory; norms and position embeddings stay ``Invariant``.
+"""
+
+import spmd_types as spmd
+from spmd_types import SpmdType
+
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.models.base.sharding import ShardingConfig
+
+DP = MeshAxisName.DP
+CP = MeshAxisName.CP
+TP = MeshAxisName.TP
+
+
+def _moonvit_state_placement() -> SpmdType:
+    return SpmdType({DP: spmd.R, CP: spmd.I, TP: spmd.I})
+
+
+def moonvit_encoder_sharding_config() -> ShardingConfig:
+    """MoonViT3d encoder boundary; its ``pos_embed`` table is TP-invariant.
+
+    ``patch_embed`` wraps the plain ``pixel_values`` input as a TP-invariant
+    tensor so the rest of the encoder runs in distributed tensor space.
+    """
+    return ShardingConfig(
+        state_shardings={"pos_embed": _moonvit_state_placement()},
+        output_shardings=SpmdType({DP: spmd.V, CP: spmd.I, TP: spmd.I}),
+    )
+
+
+def moonvit_projector_sharding_config() -> ShardingConfig:
+    """Projector output: TP- and CP-invariant."""
+    return ShardingConfig(
+        output_shardings=SpmdType({DP: spmd.V, CP: spmd.I, TP: spmd.I}),
+    )

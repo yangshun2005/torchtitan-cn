@@ -1,0 +1,21 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from torchtitan.models.qwen3_5.model import Qwen35Model
+from .flavors import (
+    build_model_config,
+    MODEL_FLAVORS,
+    QWEN3_6_SPECIAL_TOKENS,
+    QWEN3_6_VISION_PROCESSOR_KWARGS,
+)
+
+__all__ = [
+    "MODEL_FLAVORS",
+    "QWEN3_6_SPECIAL_TOKENS",
+    "QWEN3_6_VISION_PROCESSOR_KWARGS",
+    "Qwen35Model",
+    "build_model_config",
+]

@@ -1,0 +1,1497 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import copy
+import importlib
+import logging
+import math
+import os
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, MISSING
+from fractions import Fraction
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.nn import init
+from torch.nn.attention.flex_attention import and_masks
+from transformers import AutoConfig
+from transformers.configuration_utils import PretrainedConfig
+from transformers.integrations.flex_attention import flex_attention_forward
+from transformers.modeling_utils import AttentionInterface, PreTrainedModel
+
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.models.base.model import BaseModel, FlopsEstimator
+from torchtitan.models.base.module import Module, ModuleDict
+from torchtitan.models.common.attention import (
+    create_attention_mask,
+    get_causal_mask_mod,
+    get_document_mask_mod,
+)
+from torchtitan.models.common.flops import quadratic_attention_flops
+
+from .parallelize import parallelize_hf_transformers
+from .pipeline import pipeline_hf_transformers
+
+
+logger = logging.getLogger(__name__)
+
+# HF's own _init_weights, captured before _patch_hf_llama_like replaces it, so the
+# patched version can delegate modules whose init it does not reimplement.
+_hf_init_weights = PreTrainedModel._init_weights
+
+
+class HFFlexKernel(Module):
+    """Flex-attention kernel wrapped as a titan Module for declarative TP.
+
+    Runs the flex HOP over q/k/v. Under TP the Module protocol wraps this
+    forward in a local SPMD region (driven by the ``ShardingConfig`` set in
+    hf_sharding.py): q/k/v are plain local tensors carrying head-sharded SPMD
+    annotations, and the output receives the corresponding head-sharded
+    annotation. Expressing the sharding declaratively
+    ``ShardingConfig`` keeps it consistent with Titan's own
+    attention instead of requiring a hand-rolled local wrapper.
+
+    The HF attention module and the BlockMask ride as passthrough keyword args
+    (non-tensors, so the wrapper leaves them untouched). CP is not handled
+    here (guarded in ``parallelize_hf_transformers``).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    def __init__(self, config: "HFFlexKernel.Config") -> None:
+        super().__init__()
+
+    def forward(self, query, key, value, *, module, block_mask=None, **kwargs):
+        # flex_attention_forward returns (output, lse); output is already
+        # transposed to (b, seq, heads, dim). Return the single tensor so the
+        # The local SPMD region has one tensor output.
+        out, _ = flex_attention_forward(module, query, key, value, block_mask, **kwargs)
+        return out
+
+
+def _flex_attention_torchtitan(module, query, key, value, attention_mask, **kwargs):
+    """HF ``AttentionInterface`` shim for flex attention.
+
+    Delegates to the per-attention-module ``HFFlexKernel`` when present (attached
+    under TP/EP in hf_sharding.py) so the Module protocol applies the declarative
+    local SPMD region. When no kernel is attached (e.g. FSDP-only, where the sharding
+    pass does not run), q/k/v are plain tensors and flex runs directly -- no
+    mapping needed. CP is not handled here (see the guard in
+    ``parallelize_hf_transformers``).
+    """
+    kernel = getattr(module, "_titan_flex_kernel", None)
+    if kernel is None:
+        return flex_attention_forward(
+            module, query, key, value, attention_mask, **kwargs
+        )
+    out = kernel(query, key, value, module=module, block_mask=attention_mask, **kwargs)
+    return out, None
+
+
+class SliceableModuleDict(ModuleDict):
+    """
+    A ModuleDict that supports slicing like ModuleList.
+    Keys are expected to be string representations of integers (e.g., "0", "1", "2").
+    """
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            # Handle slicing: convert slice to list of keys
+            keys = sorted(
+                self.keys(), key=lambda x: int(x) if x.isdigit() else float("inf")
+            )
+            sliced_keys = keys[key]
+            # Return a new SliceableModuleDict with the sliced items
+            return SliceableModuleDict({k: self[k] for k in sliced_keys})
+        return super().__getitem__(key)
+
+    def __iter__(self):
+        # Iterate over values in sorted order by key (as integers)
+        keys = sorted(
+            self.keys(), key=lambda x: int(x) if x.isdigit() else float("inf")
+        )
+        for key in keys:
+            yield self[key]
+
+    def __len__(self):
+        return len(self._modules)
+
+    def init_states(self, **_kwargs) -> None:
+        """No-op: HFTransformerModel handles initialization via HF mechanisms."""
+        pass
+
+
+# Define all possible mappings organized by argument type
+_TT_TO_HF_MAPPINGS = {
+    "dense": {
+        # TorchTitan dense model mappings (always available)
+        "dim": "hidden_size",
+        "n_layers": "num_hidden_layers",
+        "n_heads": "num_attention_heads",
+        "n_kv_heads": "num_key_value_heads",
+        "vocab_size": "vocab_size",
+        "norm_eps": "rms_norm_eps",
+        "max_seq_len": "max_position_embeddings",
+        "eos_id": "eos_token_id",
+    },
+    # MoE attrs use the same names in TorchTitan and HuggingFace, no remapping needed
+    "moe": {},
+}
+
+# Declarative list of TorchTitan-only attributes (no HF equivalent)
+_TT_SPECIFIC_ATTRIBUTES = [
+    "multiple_of",
+    "ffn_dim_multiplier",
+    "depth_init",
+    "attn_mask_type",
+]
+
+
+def _get_moe_attr_name(layer: nn.Module) -> str | None:
+    """Return the attribute name holding the MoE block on a decoder layer.
+
+    Models use ``mlp``.  Returns ``None`` if not present.
+    """
+    return "mlp" if hasattr(layer, "mlp") else None
+
+
+# The backend routes attention through flex. The custom impl name is registered
+# in the HF ``AttentionInterface`` (see
+# ``_configure_hf_attention``) and set on ``config._attn_implementation`` so HF
+# routes attention through ``_flex_attention_torchtitan`` -- bypassing HF's
+# per-model ``_supports_flex_attn`` gate. A causal or document/packing BlockMask
+# is applied via the titan-built mask (is_causal alone cannot express
+# cross-sample masking); see ``get_attention_metadata``.
+_ATTN_IMPLEMENTATION = "flex_torchtitan"
+
+
+def _uses_dsa(config) -> bool:
+    """True if the model uses DeepSeek-style sparse attention (DSA).
+
+    DSA models (e.g. GLM-5, model_type 'glm_moe_dsa') run an auxiliary
+    "indexer" sub-attention that scores all keys and selects the top-k per
+    query, expressing the selection as a dense additive mask. The indexer and
+    the main attention both consume the incoming attention mask as a plain
+    tensor -- the modeling code calls ``.dim()`` on it, adds it to the score
+    matrix, and combines it with the top-k selection into a dense additive mask
+    that is then handed to the attention interface. A flex ``BlockMask`` has no
+    ``.dim()`` and cannot be added elementwise, so DSA needs a dense 4D tensor
+    mask instead of a BlockMask (flex still runs, consuming the dense mask as a
+    ``score_mask``). Detected by the DSA-specific ``index_topk`` config attr.
+    """
+    return getattr(config, "index_topk", None) is not None
+
+
+class HFTransformerModel(BaseModel):
+    parallelize = parallelize_hf_transformers
+    pipeline = pipeline_hf_transformers
+
+    @classmethod
+    def _register_optimizer_hooks(
+        cls, optimizers, model_parts, parallelism_context
+    ) -> None:
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+
+    def _apply_fsdp(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        precision: PrecisionConfig,
+        parallelism: ParallelismConfig,
+    ) -> None:
+        from torchtitan.distributed.fsdp import (
+            resolve_fsdp_mesh,
+            resolve_sparse_fsdp_mesh,
+        )
+
+        from .parallelize import apply_fsdp
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        apply_fsdp(
+            self,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
+            pp_enabled=parallelism_context.pp_enabled,
+            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            ep_degree=parallelism_context.ep,
+            dp_mod_ep_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+        )
+
+    # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor inputs.
+    _skip_lm_head: bool = False
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseModel.Config, PretrainedConfig):
+        """Configuration that bridges TorchTitan and HuggingFace Transformers.
+
+        Uses properties to provide TorchTitan-style access while maintaining
+        HuggingFace compatibility.
+        """
+
+        # Redeclare PretrainedConfig dataclass fields as init=False so
+        # ``Configurable.__init_subclass__`` kw_only check passes.  These
+        # fields are set dynamically in ``__init__`` via
+        # ``PretrainedConfig.__init__``, not through the generated __init__.
+        transformers_version: str = field(init=False, default="")
+        architectures: list | None = field(init=False, default=None)
+        output_hidden_states: bool = field(init=False, default=False)
+        return_dict: bool = field(init=False, default=True)
+        dtype: str | None = field(init=False, default=None)
+        chunk_size_feed_forward: int = field(init=False, default=0)
+        is_encoder_decoder: bool = field(init=False, default=False)
+        id2label: dict | None = field(init=False, default=None)
+        label2id: dict | None = field(init=False, default=None)
+        problem_type: str | None = field(init=False, default=None)
+
+        def __post_init__(self, **kwargs) -> None:
+            # Configurable.Config.__post_init__ is ahead of PretrainedConfig
+            # in the MRO and takes no extra arguments. HF passes leftover
+            # kwargs, including attn_implementation, to self.__post_init__.
+            PretrainedConfig.__post_init__(self, **kwargs)
+
+        def __init__(
+            self,
+            model_config,
+            **kwargs,
+        ):
+            # Explicitly call PretrainedConfig.__init__ (not via MRO, since
+            # Configurable.Config's generated __init__ doesn't chain to it)
+            PretrainedConfig.__init__(
+                self, attn_implementation=_ATTN_IMPLEMENTATION, **kwargs
+            )
+            # Set param_init, sharding_config and preserve_dtype_params before
+            # Module.Config.build() accesses them. PretrainedConfig.__getattribute__
+            # doesn't recognize slots inherited from Module.Config.
+            self.param_init = (
+                None  # noqa: this sets Config.param_init, not Module._param_init
+            )
+            self.sharding_config = None
+            self.preserve_dtype_params = ()
+            # HF modules run eager; the loss and the swapped-in TorchTitan MoE (SwiGLU) can compile.
+            self.local_compile = LocalCompileConfig(
+                regions=["loss", "fused_binary_activation"]
+            )
+
+            assert model_config is not None, "model_config is required"
+
+            from .flavors import TitanMoeModelConfig
+
+            self.is_moe = isinstance(model_config, TitanMoeModelConfig)
+
+            # Create getter/setter dynamically for TT <-> HF attribute mappings
+            self._create_getter_setter_dynamically(is_moe=self.is_moe)
+
+            self._titan_injected_model_args = {}
+            self._configure_hf_attention()
+
+            self._initialize_attributes(model_config)
+
+        def build(self, **kwargs):
+            """Override build() to use _replace() instead of dataclasses.replace().
+
+            dataclasses.replace() re-invokes __init__, which is incompatible
+            with the custom __init__ here (expects model_config).
+            """
+            clone = self._replace()
+            instance = self._owner(config=clone, **kwargs)
+            if self.param_init is not None:
+                instance._param_init = self.param_init
+            return instance
+
+        def _replace(self, **overrides):
+            """Override to use ``copy.copy()`` instead of ``dataclasses.replace()``.
+
+            ``dataclasses.replace()`` re-invokes ``__init__``, which is
+            incompatible with the custom ``__init__`` here (it expects
+            ``model_config`` and calls ``PretrainedConfig.__init__``).
+            A shallow copy preserves all dynamically-set HF attributes.
+            """
+            clone = copy.copy(self)
+            for f in fields(self):
+                if f.init:
+                    continue
+                if f.name in overrides:
+                    setattr(clone, f.name, overrides[f.name])
+                elif hasattr(self, f.name):
+                    setattr(clone, f.name, getattr(self, f.name))
+                else:
+                    raise TypeError(
+                        f"{type(self).__name__} field '{f.name}' "
+                        f"(init=False) was not provided via build()"
+                    )
+            return clone
+
+        def _initialize_attributes(self, model_config):
+            """Initialize all model attributes from the config.
+
+            Only stores explicitly-set (non-default) fields in
+            ``_titan_injected_model_args`` so that loading the HF config
+            only overrides HF config values the user intentionally set
+            in the flavor, preserving model-specific HF attrs like
+            ``qk_head_dim`` or ``n_routed_experts``.
+            """
+            # Determine which fields were explicitly set (not defaults)
+            explicit_overrides = {}
+            for f in fields(model_config):
+                value = getattr(model_config, f.name)
+                default = f.default
+                if default is MISSING:
+                    # No default — always explicit
+                    explicit_overrides[f.name] = value
+                elif value != default:
+                    explicit_overrides[f.name] = value
+
+            # Set mapped attributes (TorchTitan -> HuggingFace)
+            for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
+                if hasattr(model_config, titan_name):
+                    setattr(self, hf_name, getattr(model_config, titan_name))
+
+            # Set all remaining attributes directly (TorchTitan-only + MoE)
+            for attr_name, value in vars(model_config).items():
+                if (
+                    not attr_name.startswith("_")
+                    and attr_name not in self._tt_to_hf_attribute_map
+                ):
+                    setattr(self, attr_name, value)
+
+            # Store only EXPLICIT overrides for re-application after HF
+            # config load. Mapped attrs use HF names; others use titan names.
+            for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
+                if titan_name in explicit_overrides:
+                    self._titan_injected_model_args[hf_name] = explicit_overrides[
+                        titan_name
+                    ]
+            for attr_name, value in explicit_overrides.items():
+                if attr_name not in self._tt_to_hf_attribute_map:
+                    self._titan_injected_model_args[attr_name] = value
+
+        def _configure_hf_attention(self):
+            """Configure HuggingFace attention to route through flex attention.
+
+            Routes attention through the flex HOP so a causal or document/packing
+            BlockMask can be applied -- is_causal alone cannot express
+            cross-sample (packed)
+            masking. The titan-built BlockMask (see ``get_attention_metadata``)
+            rides HF's normal ``attention_mask`` argument (HF returns an
+            already-4D/BlockMask mask as-is), so no custom mask plumbing is
+            needed. The custom impl name only exists to bypass HF's per-model
+            ``_supports_flex_attn`` gate.
+            """
+            AttentionInterface._global_mapping[
+                _ATTN_IMPLEMENTATION
+            ] = _flex_attention_torchtitan
+            self._titan_injected_model_args[
+                "attn_implementation"
+            ] = _ATTN_IMPLEMENTATION
+            self.attn_implementation = _ATTN_IMPLEMENTATION
+            # HF selects the attention function from ``config._attn_implementation``.
+            # PretrainedConfig has no ``attn_implementation`` property in this
+            # version, so the line above only sets a dead plain attribute -- set the
+            # underscore field directly (it is preserved while loading HF config,
+            # which skips underscore keys when copying the loaded HF config).
+            self._attn_implementation = _ATTN_IMPLEMENTATION
+
+        def _create_getter_setter_dynamically(self, is_moe: bool):
+            """
+            Create properties dynamically based on tt and hf attribute mappings.
+            For example, creates a property 'dim' that reads/writes to 'hidden_size'.
+            """
+
+            def _create_property(hf_name: str) -> property:
+                def getter(self):
+                    return getattr(self, hf_name)
+
+                def setter(self, value):
+                    setattr(self, hf_name, value)
+
+                return property(getter, setter)
+
+            # Setup attribute mappings
+            self._tt_to_hf_attribute_map = dict(_TT_TO_HF_MAPPINGS["dense"])
+            if is_moe:
+                self._tt_to_hf_attribute_map.update(_TT_TO_HF_MAPPINGS["moe"])
+
+            for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
+                # Identity mappings (e.g. vocab_size -> vocab_size) need no
+                # property: the HF attribute is already reachable under the same
+                # name. Creating one would make the setter ``setattr(self,
+                # hf_name)`` recurse into itself. The map entry is still used by
+                # _initialize_attributes to copy the value from the titan config.
+                if titan_name == hf_name:
+                    continue
+                # Create getter/setter for attribute that don't already exist
+                if not hasattr(self.__class__, titan_name):
+                    setattr(self.__class__, titan_name, _create_property(hf_name))
+
+        def __repr__(self) -> str:
+            args_lines = [
+                f"{k}={getattr(self, k)!r}"
+                for k in sorted(self._titan_injected_model_args.keys())
+                if hasattr(self, k)
+            ]
+            args_str = "\n".join(args_lines)
+            return f"{self.__class__.__name__}(\n{args_str}\n)"
+
+        def load_hf_config(
+            self,
+            *,
+            hf_model_id: str,
+            max_context_length: int,
+            deterministic: bool,
+        ) -> None:
+            """Populate this config from the selected Hugging Face model."""
+            # Load HF config (overwrites our HF attributes)
+            hf_model_config = AutoConfig.from_pretrained(
+                hf_model_id,
+                attn_implementation=self.attn_implementation,
+                trust_remote_code=False,
+            )
+
+            # For composite (VL) models, use the nested text config so we
+            # build the text-only CausalLM instead of the conditional model.
+            if hasattr(hf_model_config, "text_config"):
+                hf_model_config = hf_model_config.text_config
+                hf_model_config.attn_implementation = self.attn_implementation
+                # Ensure the text config has architectures for model class lookup
+                if not getattr(hf_model_config, "architectures", None):
+                    from transformers.models.auto.modeling_auto import (
+                        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+                    )
+
+                    model_type = getattr(hf_model_config, "model_type", "")
+                    cls_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(model_type)
+                    if cls_name:
+                        hf_model_config.architectures = [cls_name]
+
+            # Explicitly update attributes based on mappings
+            for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
+                if hasattr(hf_model_config, hf_name):
+                    setattr(self, titan_name, getattr(hf_model_config, hf_name))
+
+            # Copy all HF config attributes including computed ones.
+            # to_dict() misses attrs computed in __init__ (e.g., DeepSeek V3's
+            # qk_head_dim), so we copy from vars() which has them.
+            for key, value in vars(hf_model_config).items():
+                if not key.startswith("_"):
+                    setattr(self, key, value)
+
+            # Copy attribute_map for models that alias config names
+            # (e.g., DeepSeek V3 maps num_local_experts → n_routed_experts)
+            if hf_model_config.attribute_map:
+                self.attribute_map.update(hf_model_config.attribute_map)
+
+            # Re-apply explicitly-set flavor overrides (not defaults)
+            for key, value in self._titan_injected_model_args.items():
+                setattr(self, key, value)
+                # Sync expert count aliases for models that use different naming
+                # (e.g., DeepSeek V3 uses n_routed_experts, GLM uses num_local_experts)
+                if key == "num_experts" and hasattr(self, "n_routed_experts"):
+                    self.n_routed_experts = value
+
+            self.max_context_length = max_context_length
+            # Aliases HF's max_position_embeddings.
+            self.max_seq_len = max_context_length
+            self.deterministic = deterministic
+
+            # Configure HF-specific settings to match TorchTitan settings
+            # TODO: false ?
+            self.attention_bias = False
+            self.mlp_bias = False
+            self.use_cache = False
+            self.initializer_range = 1.0  # use as std for normal init in embedding
+
+            # When dim is explicitly overridden (e.g. debugmodel), derive the
+            # dependent sizes from it. Otherwise keep what AutoConfig loaded from
+            # the HF config -- models like Qwen3 decouple head_dim and
+            # intermediate_size from hidden_size/num_heads, so deriving them here
+            # would silently build the wrong architecture.
+            dim_overridden = self._titan_injected_model_args.get("dim") is not None
+            if (
+                dim_overridden
+                and not getattr(self, "is_moe", False)
+                and not hasattr(self, "inter_dim")
+            ):
+                ffn_hidden_size = 4 * self.dim
+                ffn_hidden_size = int(2 * ffn_hidden_size / 3)
+                if self.ffn_dim_multiplier is not None:
+                    ffn_hidden_size = int(self.ffn_dim_multiplier * ffn_hidden_size)
+                self.intermediate_size = self.multiple_of * (
+                    (ffn_hidden_size + self.multiple_of - 1) // self.multiple_of
+                )
+
+            # MLA models (DeepSeek V3, GLM-5) set head_dim = qk_rope_head_dim
+            # in the HF config for RoPE; don't clobber it with the standard
+            # computation. Also force num_key_value_heads = num_attention_heads
+            # because MLA has no GQA -- the KV LoRA path always produces
+            # num_attention_heads heads.
+            if hasattr(self, "qk_rope_head_dim"):
+                self.num_key_value_heads = self.num_attention_heads
+                # Ensure head_dim is set for MLA models; remote configs
+                # may not compute it in __post_init__.
+                if not getattr(self, "head_dim", None):
+                    self.head_dim = self.qk_rope_head_dim
+            elif dim_overridden:
+                # dim explicitly overridden: derive head_dim from it.
+                self.head_dim = self.dim // self.num_attention_heads
+            elif not getattr(self, "head_dim", None):
+                # HF config did not provide head_dim; use the standard derivation.
+                self.head_dim = self.dim // self.num_attention_heads
+
+            # Ensure expert groups are consistent with (possibly overridden)
+            # num_experts for models with group-level routing (DeepSeek V3).
+            # Each group needs >= 2 experts for the in-group topk(2).
+            if hasattr(self, "n_group") and hasattr(self, "n_routed_experts"):
+                while self.n_group > 1 and self.n_routed_experts // self.n_group < 2:
+                    self.n_group //= 2
+                if hasattr(self, "topk_group"):
+                    self.topk_group = min(self.topk_group, self.n_group)
+
+            return self
+
+        def _parameter_counts(
+            self, model: nn.Module, *, include_embeddings: bool
+        ) -> tuple[int, int]:
+            assert isinstance(model, HFTransformerModel)
+            named_parameters = list(model.named_parameters())
+            nparams = sum(param.numel() for _, param in named_parameters)
+            parameter_weights = {
+                id(param): Fraction(1) for _, param in named_parameters
+            }
+
+            if not include_embeddings:
+                lm_head = getattr(model, "lm_head", None)
+                lm_head_parameter_ids = (
+                    {id(param) for param in lm_head.parameters()}
+                    if isinstance(lm_head, nn.Module)
+                    else set()
+                )
+                for module in model.modules():
+                    if isinstance(module, nn.Embedding):
+                        for param in module.parameters(recurse=False):
+                            if id(param) not in lm_head_parameter_ids:
+                                parameter_weights[id(param)] = Fraction(0)
+
+            for layer in model.layers.values():
+                moe_params = getattr(layer, "_native_moe_params", None)
+                if moe_params is None:
+                    continue
+                active_expert_ratio = Fraction(
+                    moe_params["top_k"], moe_params["num_experts"]
+                )
+                if getattr(layer, "_layer_level_moe", False):
+                    moe_block = layer
+                else:
+                    moe_attr = _get_moe_attr_name(layer)
+                    if moe_attr is None:
+                        logger.warning(
+                            "HF MFU calculation could not identify the MoE block; "
+                            "counting all expert parameters as active."
+                        )
+                        continue
+                    moe_block = getattr(layer, moe_attr)
+                for param in moe_block.experts.parameters():
+                    parameter_weights[id(param)] = active_expert_ratio
+
+            nparams_for_matmul = sum(
+                param.numel() * parameter_weights[id(param)]
+                for _, param in named_parameters
+            )
+            assert nparams_for_matmul.denominator == 1
+            return nparams, nparams_for_matmul.numerator
+
+        def get_parameter_counts(self, model: nn.Module) -> tuple[int, int]:
+            return self._parameter_counts(model, include_embeddings=True)
+
+        def build_flops_estimator(
+            self, model: nn.Module, *, seq_len: int
+        ) -> FlopsEstimator:
+            # Attention cost comes from each microbatch's positions.
+            del seq_len
+            _, active_nparams = self._parameter_counts(model, include_embeddings=False)
+
+            if all(
+                hasattr(self, name)
+                for name in ("qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+            ):
+                qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+                v_head_dim = self.v_head_dim
+            else:
+                qk_head_dim = self.head_dim
+                v_head_dim = self.head_dim
+
+            layer_types = getattr(self, "layer_types", None)
+            if layer_types is None:
+                default_layer_type = (
+                    "sliding_attention"
+                    if getattr(self, "sliding_window", None) is not None
+                    else "full_attention"
+                )
+                layer_types = [default_layer_type] * len(model.layers)
+            else:
+                # Debug flavors can override num_hidden_layers while retaining the full
+                # architecture's layer_types list. Count only the layers that were
+                # built.
+                layer_types = list(layer_types[: len(model.layers)])
+                if len(layer_types) < len(model.layers):
+                    logger.warning(
+                        "HF config defines fewer layer_types than built layers; "
+                        "approximating the remaining layers as full attention."
+                    )
+                    layer_types.extend(
+                        ["full_attention"] * (len(model.layers) - len(layer_types))
+                    )
+
+            # Number of layers for each (qk_head_dim, v_head_dim,
+            # sliding_window_size) attention shape.
+            attention_shapes: Counter[tuple[int, int, int | None]] = Counter()
+            unsupported_layer_types = set()
+            for layer_type in layer_types:
+                if layer_type in ("attention", "full_attention"):
+                    sliding_window_size = None
+                elif layer_type == "sliding_attention":
+                    sliding_window_size = getattr(self, "sliding_window", None)
+                elif layer_type == "chunked_attention":
+                    sliding_window_size = getattr(self, "attention_chunk_size", None)
+                else:
+                    unsupported_layer_types.add(str(layer_type))
+                    sliding_window_size = None
+
+                layer_qk_head_dim = qk_head_dim
+                layer_v_head_dim = v_head_dim
+                if getattr(
+                    self, "model_type", None
+                ) == "gemma4_text" and layer_type in (
+                    "attention",
+                    "full_attention",
+                ):
+                    global_head_dim = getattr(self, "global_head_dim", None)
+                    if global_head_dim is not None:
+                        layer_qk_head_dim = global_head_dim
+                        layer_v_head_dim = global_head_dim
+
+                attention_shapes[
+                    (layer_qk_head_dim, layer_v_head_dim, sliding_window_size)
+                ] += 1
+
+            if unsupported_layer_types:
+                logger.warning(
+                    "HF MFU calculation does not recognize layer types "
+                    f"{sorted(unsupported_layer_types)}; "
+                    "approximating them as full attention."
+                )
+
+            document_masked = (
+                getattr(self, "attn_mask_type", "causal") == "block_causal"
+            )
+
+            def estimate(input_dict: Mapping[str, Any]) -> int:
+                # A causal query at position p attends to p + 1 keys. positions
+                # restart at each document, which only "block_causal" masks
+                # follow. Padding does no useful work, so it is not counted.
+                positions = input_dict["positions"]
+                if not document_masked:
+                    positions = torch.arange(positions.shape[0])
+                num_keys = positions[~input_dict["padding_mask"]] + 1
+                flops = 6 * active_nparams * num_keys.numel()
+                for shape, num_layers in attention_shapes.items():
+                    layer_qk_head_dim, layer_v_head_dim, sliding_window_size = shape
+                    flops += num_layers * quadratic_attention_flops(
+                        num_heads=self.n_heads,
+                        qk_head_dim=layer_qk_head_dim,
+                        v_head_dim=layer_v_head_dim,
+                        num_keys=(
+                            num_keys
+                            if sliding_window_size is None
+                            else num_keys.clamp(max=sliding_window_size)
+                        ),
+                    )
+                return flops
+
+            return estimate
+
+    def __init__(self, config: Config):
+        super().__init__()
+
+        # Try to import the model class dynamically from the transformers library if not found in globals
+        model_class_name = config.architectures[0]
+        model_cls = globals().get(model_class_name, None)
+        if model_cls is None:
+            try:
+                transformers_mod = importlib.import_module("transformers")
+                model_cls = getattr(transformers_mod, model_class_name)
+            except (ImportError, AttributeError):
+                model_cls = None
+
+        if model_cls is None:
+            # Fallback: resolve via model_type → Auto mapping.
+            # Handles cases where the config's architecture name doesn't match
+            # the actual class name.
+            from transformers.models.auto.modeling_auto import (
+                MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+            )
+
+            model_type = getattr(config, "model_type", "")
+            resolved_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(model_type)
+            if resolved_name:
+                transformers_mod = importlib.import_module("transformers")
+                model_cls = getattr(transformers_mod, resolved_name, None)
+                if model_cls is not None:
+                    model_class_name = resolved_name
+
+            if model_cls is None:
+                raise ImportError(
+                    f"Could not find model class '{model_class_name}' in globals or transformers. "
+                    f"Make sure the class is available."
+                )
+
+        # Attempt to patch model weight initialization based on architecture type
+        try:
+            model_name_prefix = model_class_name.replace("ForCausalLM", "")
+            model_module = importlib.import_module(model_cls.__module__)
+
+            # Some models name their text-stack classes with a "Text" infix
+            # (e.g. Gemma4 -> Gemma4TextAttention / Gemma4TextDecoderLayer,
+            # while the causal-LM class stays Gemma4ForCausalLM). Prefer the
+            # plain prefix, but fall back to "<prefix>Text" when the plain
+            # prefix does not resolve the attention/decoder classes -- otherwise
+            # the init patch is silently skipped and HF's default init (with the
+            # backend's initializer_range=1.0) blows up the loss.
+            for candidate in (model_name_prefix, f"{model_name_prefix}Text"):
+                if (
+                    getattr(model_module, f"{candidate}Attention", None) is not None
+                    and getattr(model_module, f"{candidate}DecoderLayer", None)
+                    is not None
+                ):
+                    model_name_prefix = candidate
+                    break
+
+            attention_cls = getattr(model_module, f"{model_name_prefix}Attention", None)
+            mlp_cls = getattr(model_module, f"{model_name_prefix}MLP", None)
+            decoder_layer_cls = getattr(
+                model_module, f"{model_name_prefix}DecoderLayer", None
+            )
+
+            # Discover MoE-specific classes
+            experts_cls = getattr(model_module, f"{model_name_prefix}Experts", None)
+            router_cls = getattr(model_module, f"{model_name_prefix}TopKRouter", None)
+
+            required_classes = {
+                "Attention": attention_cls,
+                "DecoderLayer": decoder_layer_cls,
+            }
+
+            if all(required_classes.values()):
+                logger.info(f"Applying Llama-like patch for {model_name_prefix}")
+                self._patch_hf_llama_like(
+                    decoder_layer_cls=decoder_layer_cls,
+                    attention_cls=attention_cls,
+                    mlp_cls=mlp_cls,  # mlp_cls can be None
+                    experts_cls=experts_cls,
+                    router_cls=router_cls,
+                )
+            else:
+                missing = [name for name, cls in required_classes.items() if not cls]
+                logger.warning(
+                    f"Could not find required classes ({', '.join(missing)}) for {model_name_prefix}. "
+                    "Skipping Llama-like patch."
+                )
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to apply agnostic patch for {model_class_name} due to: {e}. "
+                "Weight initialization might not match TorchTitan."
+            )
+
+        # Select the HF experts forward kernel from the explicit request in
+        # TitanMoeModelConfig.experts_implementation. Honor it or fail — never
+        # silently substitute a different kernel than the user asked for.
+        #
+        # - "native": use the HF model's own built-in experts kernel unchanged
+        #   (valid for every model; the only valid choice for models that can't
+        #   take a settable implementation).
+        # - "grouped_mm"/"batched_mm"/"eager": require a model that supports a
+        #   settable experts implementation (the @use_experts_implementation
+        #   decorator, probed up front as a classmethod). If the model can't, the
+        #   request cannot be honored -> raise rather than ignore it.
+        #
+        # All paths work transparently with hook-based EP/TP because the hooks
+        # preserve the (hidden_states, top_k_index, top_k_weights) interface.
+        if config.is_moe:
+            impl = config.experts_implementation
+            if impl == "native":
+                config._experts_implementation = None
+            elif model_cls._can_set_experts_implementation():
+                config._experts_implementation = impl
+            else:
+                raise ValueError(
+                    f"{model_class_name} does not support a settable experts "
+                    f"implementation, so experts_implementation='{impl}' cannot "
+                    "be honored. Set experts_implementation='native' to use the "
+                    "HF model's built-in experts kernel."
+                )
+
+        self.model = model_cls(config=config)
+        self.max_seq_len = config.max_seq_len
+        self.cp_mesh = None
+
+        # Convert ModuleList to ModuleDict to preserve original indices
+        # This ensures state dict keys match checkpoint keys
+        if isinstance(self.model.model.layers, nn.ModuleList):
+            self.model.model.layers = SliceableModuleDict(
+                {str(i): layer for i, layer in enumerate(self.model.model.layers)}
+            )
+
+        for layer in self.model.model.layers.values():
+            # Detect MoE layers by checking for gate/router and experts sub-modules.
+            # Gemma4 has router/experts as siblings of the dense MLP at the
+            # layer level (not inside ``mlp``).
+            moe_attr = _get_moe_attr_name(layer)
+            moe_module = getattr(layer, moe_attr, None) if moe_attr else None
+            if moe_module is not None:
+                has_gate = hasattr(moe_module, "gate") or hasattr(moe_module, "router")
+                layer.moe_enabled = has_gate and hasattr(moe_module, "experts")
+            else:
+                layer.moe_enabled = False
+
+            # Layer-level MoE: router and experts are direct children of the
+            # decoder layer, not nested inside the MLP block (e.g. Gemma4).
+            if not layer.moe_enabled:
+                has_layer_router = hasattr(layer, "router") or hasattr(layer, "gate")
+                has_layer_experts = hasattr(layer, "experts")
+                if has_layer_router and has_layer_experts:
+                    layer.moe_enabled = True
+                    layer._layer_level_moe = True
+
+        if config.is_moe:
+            from .moe_replacement import probe_native_moe_params
+
+            probe_native_moe_params(self, config)
+
+    def set_cp_mesh(self, mesh):
+        self.cp_mesh = mesh
+
+    def _patch_hf_llama_like(
+        self,
+        decoder_layer_cls,
+        attention_cls,
+        mlp_cls=None,
+        experts_cls=None,
+        router_cls=None,
+    ):
+        """
+        This patch modifies a Hugging Face Llama-like model's weight initialization to match
+        the initialization scheme used in TorchTitan. This is crucial for ensuring
+        bit-for-bit reproducibility when converting checkpoints between the
+        TorchTitan format and the Hugging Face format.
+
+        The patch targets the following aspects of the model:
+        - `PreTrainedModel._initialize_weights`: Handles meta device initialization correctly.
+        - `PreTrainedModel._init_weights`: Implements TorchTitan's specific initialization
+          for attention, MLP, embedding, and layer norm layers. This includes depth-dependent
+          initialization for attention and MLP layers.
+        - `DecoderLayer.__init__`: Adds `layer_idx` to attention and MLP modules within
+          each decoder layer, which is required for the depth-dependent initialization.
+        """
+
+        _original_decoder_layer_init = decoder_layer_cls.__init__
+
+        def _decoder_layer_init_patched(self, config: PretrainedConfig, layer_idx: int):
+            _original_decoder_layer_init(self, config, layer_idx)
+            self.layer_idx = layer_idx
+            # Ensure both attention and mlp modules have layer_idx for depth-based init
+            if hasattr(self, "self_attn"):
+                self.self_attn.layer_idx = layer_idx
+            # some models might not have mlp in each layer
+            if hasattr(self, "mlp") and self.mlp is not None:
+                self.mlp.layer_idx = layer_idx
+                # Propagate to shared experts (e.g., Qwen2 MoE, DeepSeek V3)
+                for shared_name in ("shared_expert", "shared_experts"):
+                    shared = getattr(self.mlp, shared_name, None)
+                    if shared is not None:
+                        shared.layer_idx = layer_idx
+
+        def _initialize_weights_patched(self, module, is_remote_code: bool = False):
+            # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
+            # The default _initialize_weights sets _is_hf_initialized = True even on a meta device,
+            # which prevents subsequent proper initialization.
+            #
+            # This mirrors HF's PreTrainedModel._initialize_weights and only adds
+            # the meta-device early-return below. The `is_remote_code` arg and the
+            # branch that follows are copied verbatim from HF: transformers 5.x
+            # calls this via smart_apply as `fn(module, self.is_remote_code())`,
+            # so the replacement must accept the arg and keep the remote-code
+            # guard (remote _init_weights may write params in place, so already
+            # initialized modules must be skipped). Source (transformers v5.9.0):
+            # https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/modeling_utils.py#L2464
+            if getattr(module, "_is_hf_initialized", False):
+                return
+
+            if (
+                is_remote_code
+                and all(
+                    getattr(param, "_is_hf_initialized", False)
+                    for param in module.parameters(recurse=False)
+                )
+                and all(
+                    getattr(buffer, "_is_hf_initialized", False)
+                    for buffer in module.buffers(recurse=False)
+                    if buffer is not None
+                )
+            ):
+                module._is_hf_initialized = True
+                return
+
+            for param in module.parameters(recurse=True):
+                if param.device.type == "meta":
+                    return
+
+            # If not on a meta device, call the original weight initialization
+            self._init_weights(module)
+            module._is_hf_initialized = True
+
+        def _init_weights_patched(self, module):
+            """
+            Patched version of _init_weights to match TorchTitan's initialization for Llama-like models.
+            `self` is a PreTrainedModel instance.
+            """
+            config = self.config
+            # Build tuple of classes to check for layer_idx-based init_std calculation
+            layer_idx_classes = [attention_cls]
+            if mlp_cls:
+                layer_idx_classes.append(mlp_cls)
+            layer_idx_classes = tuple(layer_idx_classes)
+
+            if isinstance(module, layer_idx_classes):
+                if not hasattr(module, "layer_idx"):
+                    raise ValueError(
+                        f"Module {module} does not have a layer_idx attribute"
+                    )
+
+                layer_idx = module.layer_idx
+
+                if hasattr(config, "depth_init") and config.depth_init:
+                    init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
+                else:
+                    init_std = 0.02 / (2 * config.num_hidden_layers) ** 0.5
+
+            if isinstance(module, attention_cls):
+                # Initialize weights and biases for q, k, v projections with
+                # std=0.02, matching Titan models. Besides full-rank q/k/v,
+                # cover the MLA low-rank projections (DeepSeek V2/V3, GLM):
+                # q_a_proj/q_b_proj (low-rank Q) and kv_a_proj_with_mqa/kv_b_proj
+                # (low-rank KV). Titan's deepseek_v3 inits all of wq_a/wq_b/wkv_a/
+                # wkv_b at std=0.02 too; only the output proj is depth-scaled.
+                # The MLA RMSNorms (q_a_layernorm/kv_a_layernorm) are handled by
+                # the norm branch below. Missing these left them at their
+                # construction-time values (not reset by init).
+                for proj_name in [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                ]:
+                    proj = getattr(module, proj_name, None)
+                    if proj is None:
+                        continue
+                    nn.init.trunc_normal_(proj.weight, mean=0.0, std=0.02)
+                    if proj.bias is not None:
+                        fan_in, _ = init._calculate_fan_in_and_fan_out(proj.weight)
+                        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                        init.uniform_(proj.bias, -bound, bound)
+
+                # Handle different names for the output projection layer
+                o_proj = getattr(module, "o_proj", getattr(module, "dense", None))
+                if o_proj is not None:
+                    nn.init.trunc_normal_(o_proj.weight, mean=0.0, std=init_std)
+                    if o_proj.bias is not None:
+                        fan_in, _ = init._calculate_fan_in_and_fan_out(o_proj.weight)
+                        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                        init.uniform_(o_proj.bias, -bound, bound)
+
+            elif mlp_cls and isinstance(module, mlp_cls):
+                # Handle different names for MLP layers
+                gate_proj = getattr(module, "gate_proj", getattr(module, "fc1", None))
+                up_proj = getattr(module, "up_proj", None)
+                down_proj = getattr(module, "down_proj", getattr(module, "fc2", None))
+
+                # gate_proj (or fc1) should always use std=0.02 for numerical stability.
+                if gate_proj is not None:
+                    nn.init.trunc_normal_(gate_proj.weight, mean=0.0, std=0.02)
+                    if gate_proj.bias is not None:
+                        fan_in, _ = init._calculate_fan_in_and_fan_out(gate_proj.weight)
+                        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                        init.uniform_(gate_proj.bias, -bound, bound)
+                # up_proj and down_proj (or fc2) use the depth-dependent init_std.
+                if up_proj is not None:
+                    nn.init.trunc_normal_(up_proj.weight, mean=0.0, std=init_std)
+                    if up_proj.bias is not None:
+                        fan_in, _ = init._calculate_fan_in_and_fan_out(up_proj.weight)
+                        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                        init.uniform_(up_proj.bias, -bound, bound)
+                if down_proj is not None:
+                    nn.init.trunc_normal_(down_proj.weight, mean=0.0, std=init_std)
+                    if down_proj.bias is not None:
+                        fan_in, _ = init._calculate_fan_in_and_fan_out(down_proj.weight)
+                        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                        init.uniform_(down_proj.bias, -bound, bound)
+
+            elif experts_cls and isinstance(module, experts_cls):
+                # MoE expert weights are 3D parameter tensors (not nn.Linear)
+                if hasattr(module, "gate_up_proj"):
+                    nn.init.trunc_normal_(module.gate_up_proj, mean=0.0, std=0.02)
+                if hasattr(module, "down_proj"):
+                    nn.init.trunc_normal_(module.down_proj, mean=0.0, std=0.02)
+
+            elif router_cls and isinstance(module, router_cls):
+                if hasattr(module, "weight"):
+                    nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02)
+
+            elif module is getattr(
+                self, "lm_head", None
+            ):  # TODO(3outeille): find a better way to detect lm_head
+                final_out_std = config.hidden_size**-0.5
+                cutoff_factor = 3
+                nn.init.trunc_normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=final_out_std,
+                    a=-cutoff_factor * final_out_std,
+                    b=cutoff_factor * final_out_std,
+                )
+                if module.bias is not None:
+                    module.bias.data.zero_()
+
+            elif isinstance(module, nn.Embedding):
+                # When tie_word_embeddings is True, use lm_head initialization
+                if (
+                    hasattr(config, "tie_word_embeddings")
+                    and config.tie_word_embeddings
+                ):
+                    final_out_std = config.hidden_size**-0.5
+                    cutoff_factor = 3
+                    nn.init.trunc_normal_(
+                        module.weight,
+                        mean=0.0,
+                        std=final_out_std,
+                        a=-cutoff_factor * final_out_std,
+                        b=cutoff_factor * final_out_std,
+                    )
+                else:
+                    std = config.initializer_range
+                    module.weight.data.normal_(mean=0.0, std=std)
+
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+
+            elif (
+                isinstance(
+                    module,
+                    (nn.GroupNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d),
+                )
+                or "LayerNorm" in module.__class__.__name__
+                or "RMSNorm" in module.__class__.__name__
+            ):
+                # Norms can exist without weights (in which case they are None from torch primitives)
+                if hasattr(module, "weight") and module.weight is not None:
+                    module.weight.data.fill_(1.0)
+                if hasattr(module, "bias") and module.bias is not None:
+                    module.bias.data.zero_()
+
+            elif "RotaryEmbedding" in module.__class__.__name__:
+                # HF rotary modules compute their inv_freq buffers in __init__, which
+                # meta init + to_empty() leaves uninitialized. HF's _init_weights
+                # recomputes them for every rope_type, so delegate instead of
+                # reimplementing its rope dispatch.
+                _hf_init_weights(self, module)
+
+        decoder_layer_cls.__init__ = _decoder_layer_init_patched
+        PreTrainedModel._init_weights = _init_weights_patched
+        PreTrainedModel._initialize_weights = _initialize_weights_patched
+
+    @property
+    def tok_embeddings(self):
+        """Returns the model's embed_tokens, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "embed_tokens"
+        ):  # Llama-like
+            return self.model.model.embed_tokens
+        else:
+            raise AttributeError(
+                "Could not find embed_tokens in the model. Please check the model structure."
+            )
+
+    @tok_embeddings.setter
+    def tok_embeddings(self, value):
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "embed_tokens"
+        ):  # Llama-like
+            self.model.model.embed_tokens = value
+        else:
+            raise AttributeError(
+                "Could not find embed_tokens in the model. Please check the model structure."
+            )
+
+    @property
+    def layers(self):
+        """Returns the model's layers, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "layers"
+        ):  # Llama-like
+            return self.model.model.layers
+        else:
+            # Add more cases here if needed for other model architectures
+            raise AttributeError(
+                "Could not find layers in the model. Please check the model structure."
+            )
+
+    @layers.setter
+    def layers(self, value):
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "layers"
+        ):  # Llama-like
+            self.model.model.layers = value
+        else:
+            raise AttributeError(
+                "Could not find layers in the model. Please check the model structure."
+            )
+
+    @property
+    def norm(self):
+        """Returns the model's norm, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "norm"
+        ):  # Llama-like
+            return self.model.model.norm
+        elif hasattr(self.model, "model") and hasattr(
+            self.model.model, "final_layernorm"
+        ):  # Phi-like
+            return self.model.model.final_layernorm
+        else:
+            raise AttributeError(
+                "Could not find norm in the model. Please check the model structure."
+            )
+
+    @norm.setter
+    def norm(self, value):
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "norm"
+        ):  # Llama-like
+            self.model.model.norm = value
+        elif hasattr(self.model, "model") and hasattr(
+            self.model.model, "final_layernorm"
+        ):  # Phi-like
+            self.model.model.final_layernorm = value
+        else:
+            raise AttributeError(
+                "Could not find norm in the model. Please check the model structure."
+            )
+
+    @property
+    def lm_head(self):
+        """Returns the model's output layer, handling different Hugging Face model structures."""
+        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
+            return self.model.lm_head
+        else:
+            raise AttributeError(
+                "Could not find lm_head in the model. Please check the model structure."
+            )
+
+    @lm_head.setter
+    def lm_head(self, value):
+        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
+            self.model.lm_head = value
+        else:
+            raise AttributeError(
+                "Could not find lm_head in the model. Please check the model structure."
+            )
+
+    @property
+    def rotary_emb(self):
+        """Returns the model's rotary_emb, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "rotary_emb"
+        ):  # Llama-like
+            return self.model.model.rotary_emb
+        else:
+            raise AttributeError(
+                "Could not find rotary_emb in the model. Please check the model structure."
+            )
+
+    @rotary_emb.setter
+    def rotary_emb(self, value):
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "rotary_emb"
+        ):  # Llama-like
+            self.model.model.rotary_emb = value
+        else:
+            raise AttributeError(
+                "Could not find rotary_emb in the model. Please check the model structure."
+            )
+
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, Any],
+        *,
+        parallelism_context: ParallelismContext,
+        parallelism: ParallelismConfig,
+        max_num_documents: int | None = None,
+        global_routing_token_counts: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any]]:
+        """Build the attention mask (when positions are present), CP-shard, return."""
+        del max_num_documents, global_routing_token_counts
+        # Function-local import avoids a circular import.
+        from torchtitan.distributed import context_parallel
+        from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+        from torchtitan.models.common.attention.cp_attention import (
+            AllGatherKVFlexInnerAttention,
+        )
+        from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+
+        input_shardings = decoder_input_sharding()
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
+        input_dict.pop("padding_mask", None)
+        if "attention_metadata" not in input_dict:
+            positions = input_dict.get("positions")
+            if positions is not None:
+                masks = self.get_attention_metadata(positions=positions)
+                if masks is not None:
+                    input_dict["attention_metadata"] = masks
+
+        if parallelism_context.cp_enabled:
+            load_balancer_config = parallelism.context_parallel_load_balancer
+            load_balancer = (
+                load_balancer_config.build(
+                    seq_len=context_parallel.get_cp_input_seq_len(
+                        input_dict, input_shardings=input_shardings
+                    ),
+                    attention_metadata=input_dict.get("attention_metadata"),
+                )
+                if load_balancer_config is not None
+                else None
+            )
+            permutation = (
+                load_balancer.generate_permutation()
+                if load_balancer is not None
+                else None
+            )
+            if "attention_metadata" in input_dict:
+                input_dict[
+                    "attention_metadata"
+                ] = AllGatherKVFlexInnerAttention.prepare_cp_metadata(
+                    input_dict["attention_metadata"],
+                    permutation=permutation,
+                )
+            input_dict = context_parallel.shard_tensors(
+                input_dict,
+                input_shardings=input_shardings,
+                permutation=permutation,
+            )
+
+        # DSA attention masks are dense tensors but are not decoder inputs;
+        # preserve the old trainer behavior by annotating only declared names.
+        annotated = annotate_input_spmd_types(
+            parallelism_context,
+            {name: input_dict[name] for name in input_shardings if name in input_dict},
+            input_shardings,
+        )
+        input_dict.update(annotated)
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
+        inputs = input_dict.pop("input")
+        labels = input_dict.pop("labels")
+        return inputs, labels, input_dict, loss_kwargs
+
+    def get_attention_metadata(self, positions: torch.Tensor):
+        """Build a flex BlockMask (causal or document-causal).
+
+        ``forward`` (or the trainer under CP) calls this and passes the result
+        through as the HF ``attention_mask``. ``attn_mask_type`` selects the
+        mask: "block_causal" is causal AND same-document, so packed samples
+        don't attend across boundaries (which ``is_causal`` alone cannot
+        express); "causal" is plain causal (flex with no mask would be full
+        attention, so a causal BlockMask is still required).
+        """
+        if _uses_dsa(self.model.config):
+            # DSA models cannot consume a flex BlockMask: their indexer and main
+            # attention treat the mask as a dense additive tensor (see
+            # ``_uses_dsa``). Return a dense 4D additive causal mask so the DSA
+            # modeling code works (its ``create_causal_mask`` returns an
+            # already-4D mask as-is) and flex applies the model-built dense mask
+            # as a ``score_mask``.
+            return self._build_dense_attention_mask(positions)
+        if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
+            mask_mod = and_masks(
+                get_causal_mask_mod(),
+                get_document_mask_mod(positions),
+            )
+        else:
+            mask_mod = get_causal_mask_mod()
+        num_tokens = positions.shape[0]
+        return create_attention_mask(
+            mask_mod,
+            1,
+            None,
+            num_tokens,
+            num_tokens,
+            device=positions.device,
+            BLOCK_SIZE=128,
+            separate_full_blocks=not is_in_batch_invariant_mode(),
+        )
+
+    def _build_dense_attention_mask(self, positions: torch.Tensor) -> torch.Tensor:
+        """Dense 4D additive attention mask for DSA models under flex.
+
+        DSA (DeepSeek sparse attention) models cannot use a flex BlockMask (see
+        ``_uses_dsa``); they need a dense additive tensor mask. Build a
+        ``[1, 1, num_tokens, num_tokens]`` mask with ``0.0`` on allowed positions and ``-inf``
+        elsewhere. "causal" allows key ``j <= query i``; "block_causal"
+        additionally requires same-document (positions reset to 0 at each packed
+        sample boundary), mirroring ``get_causal_mask_mod`` /
+        ``get_document_mask_mod``.
+        """
+        num_tokens = positions.shape[0]
+        device = positions.device
+        dtype = self.tok_embeddings.weight.dtype
+        idx = torch.arange(num_tokens, device=device)
+        # Query i may attend to key j when j <= i.
+        allowed = idx[:, None] >= idx[None, :]
+        if getattr(self.model.config, "attn_mask_type", "causal") == "block_causal":
+            doc_ids = torch.cumsum((positions == 0).int(), dim=0) - 1
+            same_doc = doc_ids[:, None] == doc_ids[None, :]
+            allowed = allowed & same_doc
+        mask = torch.zeros((num_tokens, num_tokens), device=device, dtype=dtype)
+        mask.masked_fill_(~allowed, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, *args, **kwargs):
+        positions = kwargs.pop("positions", None)
+        attention_metadata = kwargs.pop("attention_metadata", None)
+        model_args = (args[0].unsqueeze(0), *args[1:])
+
+        if positions is not None:
+            # Per-document positions (reset at packed-sample boundaries) drive
+            # RoPE; the BlockMask handles cross-sample masking. Under CP these are
+            # the sequence-sharded global positions (load-balancer permuted),
+            # which is exactly what RoPE needs for each local shard -- a plain
+            # arange would use the wrong positions.
+            #
+            # The BlockMask is prebuilt in ``preprocess_inputs`` and passed
+            # in via ``attention_metadata``.
+            kwargs["position_ids"] = positions.unsqueeze(0)
+        else:
+            local_seq_len = args[0].shape[0]
+            kwargs["position_ids"] = torch.arange(
+                local_seq_len, device=args[0].device
+            ).unsqueeze(0)
+
+        if attention_metadata is not None:
+            # HF returns an already-4D mask / BlockMask as-is (see
+            # masking_utils._preprocess_mask_arguments), so the titan-built
+            # BlockMask flows straight through to the flex attention function.
+            kwargs["attention_mask"] = attention_metadata
+
+        output = self.model.model(*model_args, **kwargs)
+        hidden_states = output.last_hidden_state.squeeze(0)
+
+        if self._skip_lm_head:
+            return hidden_states
+        output = self.model.lm_head(hidden_states)
+
+        # Numerical-test hook: when HF_BACKEND_LOGIT_DUMP=<dir> is set, append
+        # this rank's per-forward logits (+ CP coordinate) to a file. Used by
+        # tests/run_cp_pp_numerical.sh to compare CP-only vs CP+PP logits from a
+        # shared seed checkpoint. Off (no overhead) unless the env var is set.
+        _dump_dir = os.environ.get("HF_BACKEND_LOGIT_DUMP")
+        if _dump_dir is not None:
+            self._maybe_dump_logits(_dump_dir, output)
+
+        return output
+
+    def _maybe_dump_logits(self, dump_dir: str, logits: torch.Tensor) -> None:
+        """Append this rank's logits (one entry per forward) for numerical tests."""
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        cp_coord = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+        recs = getattr(self, "_logit_dump_recs", None)
+        if recs is None:
+            recs = self._logit_dump_recs = []
+        recs.append((cp_coord, logits.detach().float().cpu()))
+        torch.save(recs, os.path.join(dump_dir, f"logits_rank{rank}.pt"))
+
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        # This method replicates the behavior of the original PreTrainedModel.init_weights,
+        # but with a custom weight initialization function that skips nn.Identity modules (when PP is enabled)
+
+        if getattr(self.model.config, "pruned_heads", None):
+            logger.info("Pruning heads as per model configuration.")
+            self.model.prune_heads(self.model.config.pruned_heads)
+
+        original_init_weights_fn = self.model._init_weights
+
+        def selective_init(module):
+            # For pipeline parallel, we need to skip nn.Identity modules
+            if not isinstance(module, nn.Identity):
+                original_init_weights_fn(module)
+            else:
+                logger.info("Skipping nn.Identity module during weight initialization.")
+
+        self.model.apply(selective_init)
+
+        # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device
+        # Maybe better way of handling this?
+        if not isinstance(self.tok_embeddings, nn.Identity) and not isinstance(
+            self.lm_head, nn.Identity
+        ):
+            self.model.tie_weights()
+
+    def named_children(self):
+        """
+        Provides a flattened view of the model's main components,
+        making it compatible with TorchTitan's expectations.
+        """
+        yield "tok_embeddings", self.tok_embeddings
+        yield "layers", self.layers
+        yield "norm", self.norm
+        yield "lm_head", self.lm_head
+        yield "rotary_emb", self.rotary_emb
+
+    def __setattr__(self, name, value):
+        # If a property with a setter exists for this name, use it.
+        # This is to bypass the nn.Module.__setattr__ logic that
+        # directly registers modules and skips property setters.
+        cls = self.__class__
+        if hasattr(cls, name):
+            prop = getattr(cls, name)
+            if isinstance(prop, property) and prop.fset is not None:
+                prop.fset(self, value)
+                return
+
+        # Otherwise, fall back to the default nn.Module behavior.
+        super().__setattr__(name, value)

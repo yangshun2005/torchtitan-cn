@@ -1,0 +1,587 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import copy
+import logging
+import time
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any
+
+import torch
+
+from torchtitan.components.checkpointer import DATALOADER
+from torchtitan.components.data.loader import DataloaderExhaustedError
+from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.config import apply_overrides, Configurable, PrecisionConfig
+from torchtitan.distributed import ParallelismContext, utils as dist_utils
+from torchtitan.distributed.accelerator_graph import accelerator_graphs_supported
+from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
+from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+from torchtitan.experiments.torchft.manager import maybe_semi_sync_training
+from torchtitan.experiments.torchft.optimizer import (
+    TorchFTOptim,
+    TorchFTOptimizersContainer,
+)
+from torchtitan.models.base import BaseModel
+from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.observability.metrics import (
+    build_device_memory_monitor,
+    ensure_pp_loss_visible,
+)
+from torchtitan.tools import utils
+from torchtitan.trainer import Trainer
+from torchtitan.training_engine import TrainingEngine
+
+
+logger = logging.getLogger(__name__)
+
+
+class FaultTolerantTrainingEngine(TrainingEngine):
+    """Training engine with TorchFT process groups and component adapters."""
+
+    def __init__(
+        self,
+        config: TrainingEngine.Config,
+        *,
+        model_config: BaseModel.Config,
+        precision: PrecisionConfig,
+        max_num_documents: int | None,
+        output_dir: str,
+        fault_tolerance: FaultTolerance,
+    ) -> None:
+        if config.optim.enable_accelerator_graph:
+            raise ValueError("Optim accelerator graphs are not supported with TorchFT.")
+        # The base constructor invokes the distributed-runtime hook.
+        self.fault_tolerance = fault_tolerance
+        super().__init__(
+            config,
+            model_config=model_config,
+            precision=precision,
+            max_num_documents=max_num_documents,
+            output_dir=output_dir,
+        )
+
+    def _initialize_distributed_runtime(self) -> None:
+        device_module = utils.device_module
+        # pyrefly: ignore [read-only]
+        self.device = utils.get_local_device()
+        device_module.set_device(self.device)
+
+        global_ranks = []
+        if self.fault_tolerance.enable:
+            first_rank = (
+                self.fault_tolerance.replica_id * self.fault_tolerance.group_size
+            )
+            last_rank = first_rank + self.fault_tolerance.group_size - 1
+            global_ranks = list(range(first_rank, last_rank + 1))
+
+        config = self.config
+        dist_utils.configure_nccl_for_ulysses(
+            self.model_config,
+            device_type=self.device.type,
+            comm_backend=config.comm.backend,
+        )
+        topology = dist_utils.init_distributed(
+            config.comm,
+            enable_cpu_backend=config.parallelism.fsdp_enable_cpu_offloading,
+            base_folder=self.output_dir,
+            ranks=global_ranks,
+            pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
+        )
+        self.ft_manager = self.fault_tolerance.build()
+        if self.fault_tolerance.enable:
+            # TORCHFT_TIMEOUT_SEC overrides fault_tolerance.timeout_ms.
+            ft_timeout = self.ft_manager.manager._timeout.total_seconds()
+            if ft_timeout >= config.comm.train_timeout_seconds:
+                logger.warning(
+                    f"torchft manager timeout ({ft_timeout} s) should be below "
+                    f"comm.train_timeout_seconds ({config.comm.train_timeout_seconds}); "
+                    "a slow process group reconfiguration can otherwise abort the replica."
+                )
+        self.parallelism_context = ParallelismContext.from_config(
+            config.parallelism, topology, dump_folder=self.output_dir
+        )
+        dist_utils.set_pg_timeouts(
+            timeout=timedelta(seconds=config.comm.init_timeout_seconds),
+            parallelism_context=self.parallelism_context,
+        )
+        self.garbage_collector = config.garbage_collector.build()
+        dist_utils.set_determinism(
+            self.parallelism_context,
+            self.device,
+            config.debug,
+            distinct_seed_mesh_axes=config.debug.distinct_seed_mesh_axes,
+        )
+        self.device_memory_monitor = build_device_memory_monitor()
+
+    def _initialize_model(
+        self,
+        *,
+        hf_assets_path: str,
+        create_seed_checkpoint: bool = False,
+    ) -> None:
+        super()._initialize_model(
+            hf_assets_path=hf_assets_path,
+            create_seed_checkpoint=create_seed_checkpoint,
+        )
+        self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
+
+    def _initialize_optim(self) -> None:
+        super()._initialize_optim()
+        if isinstance(self.optim, TorchFTOptim):
+            self.optim.configure_fault_tolerance(self.ft_manager)
+        if isinstance(self.optim.optimizers, TorchFTOptimizersContainer):
+            self.optim.optimizers.configure_fault_tolerance(self.ft_manager)
+
+    def _initialize_checkpointer(
+        self,
+        *,
+        extra_states: dict[str, torch.distributed.checkpoint.stateful.Stateful] | None,
+        sd_adapter: Any | None,
+    ) -> None:
+        checkpointer_config = self.config.checkpointer
+        if checkpointer_config is None:
+            return
+        self.checkpointer = checkpointer_config.build(
+            model_parts=self.model_parts,
+            optimizers=self.optim.optimizers,
+            lr_schedulers=self.optim.lr_schedulers,
+            ema=self.optim.ema,
+            extra_states={"train_state": self, **(extra_states or {})},
+            sd_adapter=sd_adapter,
+            base_folder=self.output_dir,
+            ft_manager=self.ft_manager,
+        )
+
+
+class FaultTolerantTrainer(Configurable):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Trainer.Config):
+        checkpointer: TorchFTCheckpointManager.Config | None = None
+        fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
+
+    engine: FaultTolerantTrainingEngine
+
+    def __init__(self, config: Config):
+        self.config = config
+        config.model = copy.deepcopy(config.model)
+        if config.override.imports:
+            apply_overrides(config.override, config)
+        model_config = config.model
+
+        self.engine = FaultTolerantTrainingEngine(
+            config,
+            model_config=model_config,
+            precision=config.precision,
+            max_num_documents=config.dataloader.max_num_documents,
+            output_dir=config.dump_folder,
+            fault_tolerance=config.fault_tolerance,
+        )
+        engine = self.engine
+        parallelism_context = engine.parallelism_context
+
+        # Logging needs to happen after distributed initialization.
+        config.maybe_log()
+
+        if parallelism_context.dp_enabled:
+            dp_mesh = parallelism_context.get_mesh("dp")
+            dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
+        else:
+            dp_degree, dp_rank = 1, 0
+        dp_degree, dp_rank = engine.ft_manager.get_dp_info(dp_degree, dp_rank)
+
+        # build tokenizer
+        self.tokenizer = (
+            config.tokenizer.build(tokenizer_path=config.hf_assets_path)
+            if config.tokenizer is not None
+            else None
+        )
+        self.vision_processor = (
+            config.vision_processor.build()
+            if config.vision_processor is not None
+            else None
+        )
+
+        num_pp_microbatches = (
+            config.parallelism.num_pp_microbatches
+            if parallelism_context.pp_enabled
+            else 1
+        )
+        # build dataloader
+        num_tokens_per_microbatch = (
+            config.training.num_tokens_per_microbatch_per_dp_rank
+        )
+        self.dataloader = config.dataloader.build(
+            dp_world_size=dp_degree,
+            dp_rank=dp_rank,
+            tokenizer=self.tokenizer,
+            max_context_length=config.model.max_context_length,
+            num_tokens_per_microbatch=num_tokens_per_microbatch,
+            vision_processor=self.vision_processor,
+        )
+
+        # metrics logging (FT addition: ft_enable, ft_replica_id)
+        self.metrics_processor = config.metrics.build(
+            parallelism_context=parallelism_context,
+            device_memory_monitor=engine.device_memory_monitor,
+            dump_folder=config.dump_folder,
+            pp_schedule=config.parallelism.pipeline_parallel_schedule,
+            ft_enable=config.fault_tolerance.enable,
+            ft_replica_id=config.fault_tolerance.replica_id,
+            config_dict=config.to_dict(),
+        )
+        self._local_num_flops_since_last_log = 0
+        color = self.metrics_processor.color
+
+        self.num_pp_microbatches = num_pp_microbatches
+        num_tokens_per_dp_rank = (
+            config.training.num_tokens_per_microbatch_per_dp_rank
+            * self.num_pp_microbatches
+        )
+        num_tokens_per_train_step = config.training.num_tokens_per_train_step
+        if num_tokens_per_train_step < 0:
+            num_tokens_per_train_step = num_tokens_per_dp_rank * dp_degree
+        if num_tokens_per_train_step % (num_tokens_per_dp_rank * dp_degree) != 0:
+            raise ValueError(
+                "training.num_tokens_per_train_step "
+                f"({num_tokens_per_train_step}) must be divisible by the number "
+                "of tokens processed globally in one gradient accumulation "
+                f"iteration ({num_tokens_per_dp_rank * dp_degree})."
+            )
+        self.gradient_accumulation_steps = num_tokens_per_train_step // (
+            num_tokens_per_dp_rank * dp_degree
+        )
+        if (
+            config.fault_tolerance.enable
+            and accelerator_graphs_supported()
+            and not config.training.disable_accelerator_graphs
+            and parallelism_context.fsdp_enabled
+            and self.gradient_accumulation_steps > 1
+        ):
+            raise ValueError(
+                "TorchFT does not support accelerator-graphed FSDP gradient accumulation."
+            )
+
+        engine.initialize(
+            extra_states={DATALOADER: self.dataloader},
+            hf_assets_path=config.hf_assets_path,
+            create_seed_checkpoint=config.create_seed_checkpoint,
+        )
+
+        if parallelism_context.pp_enabled:
+            ensure_pp_loss_visible(
+                parallelism_context=parallelism_context,
+                pp_schedule=config.parallelism.pipeline_parallel_schedule,
+                color=color,
+            )
+
+        # initialize device memory monitor and get peak flops for MFU calculation
+        device_memory_monitor = engine.device_memory_monitor
+        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
+        if gpu_peak_flops is not None:
+            logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        logger.info(
+            f"{engine.device.type.upper()} memory usage for model: "
+            f"{engine.model_device_mem_stats.max_reserved_gib:.2f}GiB"
+            f"({engine.model_device_mem_stats.max_reserved_pct:.2f}%)"
+        )
+
+        self.metrics_processor.optimizers = engine.optim.optimizers
+        self.metrics_processor.model_parts = engine.model_parts
+
+        # Build validator if validation is configured
+        if config.validator is not None:
+            if engine._forward_backward_accelerator_graph_enabled:
+                logger.warning("TorchFT validation runs without accelerator graphs.")
+            pp_schedule, pp_has_first_stage, pp_has_last_stage = (
+                (
+                    engine.pp_schedule,
+                    engine.pp_has_first_stage,
+                    engine.pp_has_last_stage,
+                )
+                if parallelism_context.pp_enabled
+                else (None, None, None)
+            )
+
+            self.validator = config.validator.build(
+                accelerator_graph_enabled=False,
+                parallelism=config.parallelism,
+                job_config=config,
+                dp_world_size=dp_degree,
+                dp_rank=dp_rank,
+                tokenizer=self.tokenizer,
+                vision_processor=self.vision_processor,
+                parallelism_context=parallelism_context,
+                loss_fn=engine.loss_fn,
+                metrics_processor=self.metrics_processor,
+                seq_len=config.model.max_context_length,
+                num_tokens_per_microbatch=num_tokens_per_microbatch,
+                pp_schedule=pp_schedule,
+                pp_has_first_stage=pp_has_first_stage,
+                pp_has_last_stage=pp_has_last_stage,
+            )
+
+        logger.info(
+            "Trainer is initialized with "
+            f"{num_tokens_per_dp_rank} tokens per DP rank, "
+            f"{num_tokens_per_train_step} tokens per train step, "
+            f"gradient accumulation steps {self.gradient_accumulation_steps}, "
+            f"maximum context length {config.model.max_context_length}, "
+            f"total steps {config.training.steps} "
+            f"(warmup {config.optim.lr_scheduler.warmup_steps})"
+        )
+
+    def microbatch_generator(
+        self, data_iterable: Iterable[TrainingMicrobatch]
+    ) -> Iterator[TrainingMicrobatch]:
+        data_iterator = iter(data_iterable)
+        while True:
+            data_load_start = time.perf_counter()
+            try:
+                microbatch = next(data_iterator)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+            ntokens_microbatch = (
+                self.config.training.num_tokens_per_microbatch_per_dp_rank
+            )
+            self.metrics_processor.ntokens_since_last_log += ntokens_microbatch
+            self.metrics_processor.data_loading_times.append(
+                time.perf_counter() - data_load_start
+            )
+            yield microbatch
+
+    def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
+        engine = self.engine
+        current_step = engine.num_completed_steps + 1
+        # Save the current step learning rate for logging
+        lr = engine.optim.lr_schedulers.schedulers[0].get_last_lr()[0]
+        should_log = self.metrics_processor.should_log(current_step)
+        # Start a new metrics window on the first step after loading and right
+        # after the last log or validation, so it leaves out a checkpoint saved
+        # or a validation run at that step. should_log() above initializes
+        # step_last_log on the first step, so keep this check after it.
+        if self.metrics_processor.step_last_log == engine.num_completed_steps:
+            self.metrics_processor.reset()
+            self._local_num_flops_since_last_log = 0
+
+        # Keep these variables local to shorten the code as these are
+        # the major variables that are used in the training loop.
+        parallelism_context = engine.parallelism_context
+        # All groups form one optimizer step. Each microbatch group forms one
+        # complete PP step, or one local forward/backward when PP is disabled.
+        microbatch_groups: list[list[TrainingMicrobatch]] = []
+        local_loss_token_counts: torch.Tensor | None = None
+        local_routing_token_counts: torch.Tensor | None = None
+        for _ in range(self.gradient_accumulation_steps):
+            microbatch_group = []
+            for _ in range(self.num_pp_microbatches):
+                microbatch = next(data_iterator)
+                if local_loss_token_counts is None:
+                    local_loss_token_counts = torch.zeros_like(
+                        microbatch.loss_token_counts
+                    )
+                    local_routing_token_counts = torch.zeros_like(
+                        microbatch.routing_token_counts
+                    )
+                local_loss_token_counts.add_(microbatch.loss_token_counts)
+                assert local_routing_token_counts is not None
+                local_routing_token_counts.add_(microbatch.routing_token_counts)
+                microbatch_group.append(microbatch)
+            microbatch_groups.append(microbatch_group)
+
+        assert local_loss_token_counts is not None
+        assert local_routing_token_counts is not None
+        local_main_loss_token_count = (
+            local_loss_token_counts
+            if local_loss_token_counts.ndim == 0
+            else local_loss_token_counts[0]
+        )
+        num_loss_objectives = local_loss_token_counts.numel()
+        global_token_counts = torch.cat(
+            (
+                local_loss_token_counts.reshape(-1),
+                local_routing_token_counts.reshape(-1),
+            )
+        ).to(engine.device)
+        if parallelism_context.dp_enabled:
+            global_token_counts = dist_utils.dist_sum_tensor(
+                global_token_counts, parallelism_context.get_mesh("dp")
+            )
+        global_loss_token_counts = global_token_counts[:num_loss_objectives].reshape(
+            local_loss_token_counts.shape
+        )
+        global_routing_token_counts = global_token_counts[num_loss_objectives:].reshape(
+            local_routing_token_counts.shape
+        )
+        forward_backward_result = engine.forward_backward(
+            microbatch_groups=microbatch_groups,
+            global_loss_token_counts=global_loss_token_counts,
+            global_routing_token_counts=global_routing_token_counts,
+        )
+        global_main_loss_token_count = (
+            global_loss_token_counts
+            if global_loss_token_counts.ndim == 0
+            else global_loss_token_counts[0]
+        )
+
+        grad_norm = engine.optim_step()
+        self._local_num_flops_since_last_log += forward_backward_result.num_flops
+
+        # log metrics
+        if not should_log:
+            return
+
+        accumulated_loss = forward_backward_result.loss
+        mean_num_flops = self._local_num_flops_since_last_log
+
+        if parallelism_context.dp_cp_enabled:
+            # FT addition: use ft_manager.loss_sync_pg for extra process group
+            ft_pg = engine.ft_manager.loss_sync_pg
+            loss_mesh = parallelism_context.get_mesh("loss")
+
+            # For global_avg_loss, we want the average loss across all ranks:
+            # accumulated_loss = local_loss_sum / global_valid_tokens
+            # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
+            #                 = sum(accumulated_loss)
+            #
+            # For global_max_loss, we want the max of local average losses across ranks:
+            # local_avg_loss = local_loss_sum / local_valid_tokens
+            #                = (accumulated_loss * global_valid_tokens) / local_valid_tokens
+            # global_max_loss = max(local_avg_loss)
+            local_avg_loss = (
+                accumulated_loss
+                * global_main_loss_token_count
+                / local_main_loss_token_count
+            )
+            global_avg_loss, global_max_loss, global_ntokens_seen = (
+                dist_utils.dist_sum(accumulated_loss, loss_mesh, ft_pg),
+                dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
+                dist_utils.dist_sum(
+                    torch.tensor(
+                        engine.ntokens_seen,
+                        dtype=torch.int64,
+                        device=engine.device,
+                    ),
+                    loss_mesh,
+                    ft_pg,
+                ),
+            )
+            dp_mesh = parallelism_context.get_optional_mesh("dp")
+            if dp_mesh is not None or ft_pg is not None:
+                mean_num_flops = dist_utils.dist_sum(
+                    torch.tensor(
+                        mean_num_flops, dtype=torch.float64, device=engine.device
+                    ),
+                    dp_mesh,
+                    ft_pg,
+                )
+                if dp_mesh is not None:
+                    mean_num_flops /= dp_mesh.size()
+            # ft_pg is None in semi-sync training.
+            if ft_pg is not None:
+                # Avoid artificial jumps in logged loss when replicas leave or rejoin.
+                global_avg_loss /= ft_pg.size()
+                mean_num_flops /= ft_pg.size()
+        else:
+            global_avg_loss = global_max_loss = accumulated_loss.item()
+            global_ntokens_seen = engine.ntokens_seen
+
+        extra_metrics = {
+            "n_tokens_seen": global_ntokens_seen,
+            "lr": lr,
+            **collect_aux_loss_metrics(engine.parallelism_context),
+        }
+        self.metrics_processor.log(
+            engine.num_completed_steps,
+            global_avg_loss,
+            global_max_loss,
+            float(grad_norm.item()),
+            extra_metrics=extra_metrics,
+            num_flops=mean_num_flops,
+        )
+
+    def train(self):
+        config = self.config
+        engine = self.engine
+
+        engine.load_checkpoint()
+        logger.info(f"Training starts at step {engine.num_completed_steps + 1}")
+
+        # FT addition: per-replica profiling leaf folder
+        leaf_folder = (
+            ""
+            if not engine.ft_manager.enabled
+            else f"replica_{engine.ft_manager.replica_id}"
+        )
+        with (
+            config.profiler.build(
+                global_step=engine.num_completed_steps,
+                base_folder=config.dump_folder,
+                leaf_folder=leaf_folder,
+            ) as profiler,
+            # FT addition: maybe_semi_sync_training context manager
+            maybe_semi_sync_training(
+                config.fault_tolerance,
+                ft_manager=engine.ft_manager,
+                model=engine.model_parts[0],
+                n_layers=(
+                    len(engine.model_config.layers)
+                    if hasattr(engine.model_config, "layers")
+                    else 0
+                ),
+                optimizer=engine.optim.optimizers,
+                fragment_fn=getattr(engine.model_cls, "_fragment", None),
+            ),
+        ):
+            data_iterator = self.microbatch_generator(self.dataloader)
+            while self.should_continue_training():
+                try:
+                    self.train_step(data_iterator)
+                except DataloaderExhaustedError:
+                    logger.warning("Ran out of data; last step was canceled.")
+                    break
+
+                engine.save_checkpoint(
+                    last_step=(engine.num_completed_steps == config.training.steps),
+                )
+
+                # Run validation if validator is available
+                if (
+                    self.config.validator is not None
+                    and self.validator.should_validate(engine.num_completed_steps)
+                ):
+                    self.validator.validate(
+                        engine.model_parts, engine.num_completed_steps
+                    )
+
+                # signal the profiler that the next profiling step has started
+                profiler.step()
+
+                # reduce timeout after first train step for faster signal
+                # (assuming lazy init and compilation are finished)
+                if engine.num_completed_steps == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(seconds=config.comm.train_timeout_seconds),
+                        parallelism_context=engine.parallelism_context,
+                    )
+
+        if torch.distributed.get_rank() == 0:
+            logger.info("Sleeping 2 seconds for other ranks to complete")
+            time.sleep(2)
+
+        logger.info("Training completed")
+
+    def should_continue_training(self) -> bool:
+        return self.engine.num_completed_steps < self.config.training.steps
+
+    def close(self) -> None:
+        if self.dataloader:
+            self.dataloader.close()
+        self.engine.close()
+        if self.metrics_processor:
+            self.metrics_processor.close()

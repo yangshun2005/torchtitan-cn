@@ -1,0 +1,90 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Copyright (c) Meta Platforms, Inc. All Rights Reserved.
+
+from dataclasses import dataclass, field
+
+import torch
+import torch_remat as remat
+
+from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.models.common.attention import (
+    FlexAttentionMetadata,
+    VarlenAttentionMetadata,
+)
+from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.feed_forward import DenseFeedForward
+from .state_dict_adapter import Llama3StateDictAdapter
+
+
+class Llama3TransformerBlock(TransformerBlock):
+    """
+    Llama3 TransformerBlock Module
+
+    Args:
+        layer_id (int): Identifier for the layer.
+        dim (int): Model dimension.
+        n_layers (int): Total number of layers.
+        config (Llama3TransformerBlock.Config): Block configuration.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TransformerBlock.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.attention = config.attention.build()
+        assert isinstance(config.feed_forward, DenseFeedForward.Config)
+        self.feed_forward = config.feed_forward.build()
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
+        positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+    ):
+        del aux_loss_denominator, padding_mask
+        attn_out = self.attention(self.attention_norm(x), attention_metadata, positions)
+        # The residual add reads the attention output with bare ops.
+        remat.recompute_needs_tensor(attn_out)
+        h = x + attn_out
+        ffn_out = self.feed_forward(self.ffn_norm(h))
+        # Trailing add, always saved: it saves nothing for backward, so replay skips
+        # it and its inputs need no persisting, matching checkpoint early stop.
+        return remat.region(
+            torch.add, self.remat_region_name("ffn_residual"), recompute=False
+        )(h, ffn_out)
+
+
+class Llama3Model(Decoder):
+    state_dict_adapter_cls = Llama3StateDictAdapter
+
+    """
+    Llama3Model Module
+
+    Args:
+        config (Llama3Model.Config): Model configuration.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Decoder.Config):
+        dim: int = 4096
+        vocab_size: int = 128256
+        local_compile: LocalCompileConfig = field(
+            default_factory=lambda: LocalCompileConfig(
+                regions=["loss", "fused_binary_activation", "rope"]
+            )
+        )
+
+    def __init__(self, config: Config):
+        super().__init__(config)

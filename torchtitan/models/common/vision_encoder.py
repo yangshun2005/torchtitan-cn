@@ -1,0 +1,235 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Shared model-agnostic ViT building blocks for VLM vision encoders: a
+block-diagonal FlexInnerAttention mask helper and the pre-norm transformer block
+(attention + MLP) over token-major visual patches.
+
+RoPE differs per model, so each encoder passes packed ``(row, column)``
+``positions`` through the block to the attention (a tensor, so config-based
+sharding can annotate it before it meets the head-sharded q/k). Each attention
+builds its own module from ``VisionAttention.Config.rope``.
+
+Shape suffixes:
+- T = packed visual tokens
+- D = vision dim
+- H = num heads
+- Dh = head dim
+"""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+import torch_remat as remat
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+
+from torchtitan.distributed.local_compile import compile
+from torchtitan.distributed.spmd_types import disable_dense_sp
+from torchtitan.models.base.module import Module
+from torchtitan.models.common.attention import (
+    FlexInnerAttention,
+    local_head_split,
+    VarlenAttentionMetadata,
+)
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
+from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
+from torchtitan.models.common.rope import RoPE
+
+compiled_create_block_mask = compile(create_block_mask)
+
+
+def create_block_diagonal_mask(
+    segment_lengths: torch.Tensor,
+    total_tokens: int,
+    device: torch.device,
+) -> BlockMask:
+    """Create a FlexInnerAttention mask over contiguous packed segments."""
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_lengths.shape[0], device=device, dtype=torch.int32),
+        segment_lengths.to(device=device, dtype=torch.int32),
+        # Avoid reading segment_lengths.sum() back to the host to size the
+        # output; the packed token count is already available from its shape.
+        output_size=total_tokens,
+    )
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return segment_ids[q_idx] == segment_ids[kv_idx]
+
+    return compiled_create_block_mask(
+        mask_mod,
+        1,
+        None,
+        total_tokens,
+        total_tokens,
+        device=device,
+    )
+
+
+class VisionMLP(Module):
+    """Feed-forward network with GELU activation (fc1 -> act -> fc2)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        fc1: Linear.Config
+        fc2: Linear.Config
+        act_fn: GELU.Config = field(
+            default_factory=lambda: GELU.Config(approximate="tanh")
+        )
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.linear_fc1 = config.fc1.build()
+        self.linear_fc2 = config.fc2.build()
+        self.act_fn = config.act_fn.build()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Each Linear declares its own remat regions.
+        hidden_TF = self.linear_fc1(x)
+        remat.recompute_needs_tensor(hidden_TF)
+        return self.linear_fc2(self.act_fn(hidden_TF))
+
+
+class VisionAttention(Module):
+    """Multi-head self-attention over visual patches.
+
+    The inner attention is flex (``BlockMask`` metadata) or varlen
+    (``VarlenAttentionMetadata``); the encoder builds the matching metadata.
+
+    Separate q/k/v projections (clean per-head ColwiseParallel under TP). RoPE is
+    applied via the configured ``rope`` module so this class is reused
+    across models with different rotary formulations.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        num_heads: int
+        wq: Linear.Config
+        wk: Linear.Config
+        wv: Linear.Config
+        proj: Linear.Config
+        rope: RoPE.Config | None
+        inner_attention: Module.Config = field(
+            default_factory=FlexInnerAttention.Config
+        )
+
+        def flops_per_query_key_pair(self) -> int:
+            return 12 * self.dim
+
+    def __init__(self, config: Config):
+        super().__init__()
+        if config.dim % config.num_heads != 0:
+            raise ValueError(
+                f"VisionAttention dim ({config.dim}) must be divisible by "
+                f"num_heads ({config.num_heads})."
+            )
+        self.head_dim = config.dim // config.num_heads
+
+        self.wq = config.wq.build()
+        self.wk = config.wk.build()
+        self.wv = config.wv.build()
+        self.proj = config.proj.build()
+        self.rope = config.rope.build() if config.rope is not None else None
+        self.inner_attention = config.inner_attention.build()
+
+    def _qkv(
+        self, x_TD: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_THDh = local_head_split(self.wq(x_TD), self.head_dim)
+        k_THDh = local_head_split(self.wk(x_TD), self.head_dim)
+        v_THDh = local_head_split(self.wv(x_TD), self.head_dim)
+        return q_THDh, k_THDh, v_THDh
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        attention_mask: BlockMask | VarlenAttentionMetadata,
+    ) -> torch.Tensor:
+        num_tokens = x.shape[0]
+        # The q/k/v projections share one TP-replicated input.
+        x = maybe_gather_tp_input(self, x)
+
+        # -1 infers the head count locally (= num_heads / TP under tensor
+        # parallelism, where wq/wk/wv are colwise-sharded).
+        # Each Linear declares its own remat regions.
+        q_THDh, k_THDh, v_THDh = self._qkv(x)
+
+        remat.recompute_needs_tensor(q_THDh, k_THDh)
+        if self.rope is not None:
+            q_THDh, k_THDh = self.rope(q_THDh, k_THDh, positions=positions)
+
+        out_THDh = remat.region(
+            self.inner_attention,
+            self.remat_region_name("inner_attention"),
+            recompute=self.remat_should_recompute("inner_attention"),
+        )(q_THDh, k_THDh, v_THDh, attention_metadata=attention_mask)
+        remat.recompute_needs_tensor(out_THDh)
+        out_TD = out_THDh.reshape(num_tokens, -1)
+        return self.proj(out_TD)
+
+
+class VisionTransformerBlock(Module):
+    """Pre-norm transformer block: norm -> attn -> residual -> norm -> mlp."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        # MoonViT normalizes with RMSNorm; Qwen3.5 and Muse Glimmer use LayerNorm.
+        norm1: LayerNorm.Config | RMSNorm.Config
+        norm2: LayerNorm.Config | RMSNorm.Config
+        attn: VisionAttention.Config
+        mlp: VisionMLP.Config
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.norm1 = config.norm1.build()
+        self.norm2 = config.norm2.build()
+        self.attn = config.attn.build()
+        self.mlp = config.mlp.build()
+
+    # The encoder forward already runs under disable_dense_sp, but activation
+    # remat replays each block during backward, after that scope has exited.
+    # Entering it here keeps the replay's TP layout equal to the forward's.
+    @disable_dense_sp()
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        attention_mask: BlockMask | VarlenAttentionMetadata,
+    ) -> torch.Tensor:
+        attn_out = self.attn(
+            self.norm1(x),
+            positions=positions,
+            attention_mask=attention_mask,
+        )
+        # The residual add reads the attention output with bare ops.
+        remat.recompute_needs_tensor(attn_out)
+        x = x + attn_out
+        mlp_out = self.mlp(self.norm2(x))
+        # Trailing add, always saved: it saves nothing for backward, so replay skips
+        # it and its inputs need no persisting, matching checkpoint early stop.
+        return remat.region(
+            torch.add, self.remat_region_name("ffn_residual"), recompute=False
+        )(x, mlp_out)
+
+
+def get_packed_vision_grids(
+    input_dict: Mapping[str, Any]
+) -> tuple[tuple[int, int, int], ...]:
+    """Extract image and video patch grids from a raw CPU microbatch."""
+    return tuple(
+        (temporal, height, width)
+        for pixels, grid_key in (
+            ("pixel_values", "grid_thw"),
+            ("pixel_values_videos", "grid_thw_videos"),
+        )
+        if input_dict.get(pixels) is not None
+        for temporal, height, width in input_dict[grid_key].tolist()
+    )

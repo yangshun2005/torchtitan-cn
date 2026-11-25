@@ -1,0 +1,312 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.models.common.attention import VarlenInnerAttention
+from torchtitan.models.common.attention.cp_attention import UlyssesVarlenInnerAttention
+from torchtitan_recipes.tests.models.llama3 import llama3_debugmodel
+
+from tests.integration_tests import (
+    get_importable_config_module,
+    IntegrationTestDefinition,
+    validate_fake_pg_compatibility,
+)
+from tests.integration_tests.features import (
+    build_features_test_list,
+    llama3_debugmodel_default,
+    llama3_debugmodel_hf_checkpoint_load,
+    muse_glimmer_debugmodel_fsdp2_per_group_accelerator_graph,
+)
+from tests.integration_tests.h100 import build_h100_tests_list
+from tests.integration_tests.models import build_model_tests_list
+from tests.integration_tests.run_tests import (
+    _parse_test_suites,
+    run_single_test,
+    run_tests,
+)
+
+
+def test_hf_checkpoint_load_path_comes_from_test_config(monkeypatch) -> None:
+    test_output_dir = "/tmp/model_only_hf_checkpoint"
+    monkeypatch.setenv("TORCHTITAN_TEST_OUTPUT_DIR", test_output_dir)
+
+    config = llama3_debugmodel_hf_checkpoint_load()
+
+    assert config.checkpointer.initial_load_path == (
+        f"{test_output_dir}/hf_checkpoint/exports/step-10/"
+    )
+
+
+def test_spmd_typechecking_config_disables_local_compile() -> None:
+    config = llama3_debugmodel_default()
+
+    assert config.debug.spmd_typechecking
+    assert config.model.local_compile.regions == []
+    config.__post_init__()
+
+
+def test_integration_run_exports_test_output_dir(monkeypatch, tmp_path: Path) -> None:
+    captured_env = None
+
+    def fake_run_cmd(cmd, timeout=None, env=None):
+        nonlocal captured_env
+        captured_env = env
+        return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr("tests.integration_tests.run_tests._run_cmd", fake_run_cmd)
+    test = IntegrationTestDefinition(
+        configs=[llama3_debugmodel],
+        test_name="output_dir_test",
+        ngpu=1,
+    )
+
+    run_single_test(test, str(tmp_path))
+
+    assert captured_env is not None
+    assert captured_env["TORCHTITAN_TEST_OUTPUT_DIR"] == str(
+        tmp_path / "output_dir_test"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "num_devices",
+        "ngpu_arg",
+        "test_ngpu",
+        "execution_mode",
+        "entrypoints",
+        "parallel",
+        "should_raise",
+    ),
+    [
+        (7, 8, 8, "real_pg", (), True, True),
+        (8, 8, 8, "real_pg", (), True, False),
+        (7, 8, 8, "real_pg", (), False, True),
+        (4, 8, 4, "real_pg", (), False, False),
+        (4, 8, 4, "real_pg", ("torchtitan.rl.train",), True, False),
+        (2, 8, 8, "fake_pg", (), True, True),
+        (1, 1, 8, "fake_pg", (), True, False),
+        (1, 8, 8, "fake_pg", (), False, False),
+        (0, 8, 8, "fake_pg", (), False, True),
+    ],
+)
+def test_run_tests_requires_visible_devices(
+    monkeypatch,
+    tmp_path: Path,
+    num_devices,
+    ngpu_arg,
+    test_ngpu,
+    execution_mode,
+    entrypoints,
+    parallel,
+    should_raise,
+) -> None:
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: num_devices)
+    started = []
+
+    def record_run(*args, **kwargs):
+        started.append(kwargs)
+
+    monkeypatch.setattr("tests.integration_tests.run_tests.run_single_test", record_run)
+    test = IntegrationTestDefinition(
+        configs=[llama3_debugmodel],
+        test_name="device_check_test",
+        ngpu=test_ngpu,
+        entrypoints=list(entrypoints),
+    )
+    args = SimpleNamespace(
+        test_name="all",
+        ngpu=ngpu_arg,
+        output_dir=str(tmp_path),
+        execution_mode=execution_mode,
+    )
+
+    if should_raise:
+        with pytest.raises(ValueError, match=f"only {num_devices} accelerator"):
+            run_tests(args, [test], parallel=parallel)
+        assert not started
+    else:
+        run_tests(args, [test], parallel=parallel)
+        assert len(started) == 1
+        if not parallel or entrypoints:
+            assert "gpu_ids" not in started[0]
+        else:
+            assert all(gpu_id < num_devices for gpu_id in started[0]["gpu_ids"])
+
+
+def test_config_module_resolves_python_m_entrypoint(monkeypatch) -> None:
+    def config_fn():
+        return llama3_debugmodel()
+
+    monkeypatch.setattr(config_fn, "__module__", "__main__")
+    monkeypatch.setattr(
+        sys.modules["__main__"],
+        "__spec__",
+        SimpleNamespace(name="tests.integration_tests.example"),
+    )
+
+    assert get_importable_config_module(config_fn) == "tests.integration_tests.example"
+
+
+def test_numerics_run_uses_seed_config(monkeypatch, tmp_path: Path) -> None:
+    captured_command = None
+
+    def seed_config():
+        return llama3_debugmodel()
+
+    def fake_run(command, **kwargs):
+        nonlocal captured_command
+        captured_command = command
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    golden_path = tmp_path / "golden.txt"
+    golden_path.write_text("# step loss\n1 1.0\n")
+    monkeypatch.setattr("tests.integration_tests.run_tests.subprocess.run", fake_run)
+    test = IntegrationTestDefinition(
+        configs=[llama3_debugmodel],
+        test_name="seed_config_test",
+        ngpu=1,
+        golden_numerics_path=str(golden_path),
+        loss_compare_seed_config=seed_config,
+    )
+
+    run_single_test(test, str(tmp_path))
+
+    assert captured_command is not None
+    assert f"--seed-module={seed_config.__module__}" in captured_command
+    assert f"--seed-config={seed_config.__name__}" in captured_command
+
+
+def test_split_backward_pp_cases_exercise_varlen_accelerator_graphs() -> None:
+    tests_by_name = {test.test_name: test for test in build_features_test_list()}
+
+    for test_name in ("pp_looped_zero_bubble", "pp_zbv", "pp_custom_csv"):
+        test = tests_by_name[test_name]
+        config = test.configs[0]()
+        assert not test.disabled
+        assert not config.training.disable_accelerator_graphs
+        assert isinstance(
+            config.model.layers[0].attention.inner_attention,
+            VarlenInnerAttention.Config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("test_name", "tp_degree", "ngpu"),
+    [("fsdp+cp_ulysses_varlen", 1, 4), ("fsdp+tp+cp_ulysses_varlen", 2, 8)],
+)
+def test_varlen_cp_combinations_require_real_collectives(
+    test_name, tp_degree, ngpu
+) -> None:
+    tests_by_name = {test.test_name: test for test in build_features_test_list()}
+    test = tests_by_name[test_name]
+    config = test.configs[0]()
+
+    assert test.use_real_pg and not test.disabled
+    assert test.ngpu == ngpu
+    assert config.parallelism.data_parallel_shard_degree == 2
+    assert config.parallelism.context_parallel_degree == 2
+    assert config.parallelism.tensor_parallel_degree == tp_degree
+    assert config.parallelism.context_parallel_load_balancer is None
+    assert not config.training.disable_accelerator_graphs
+    assert config.dataloader.max_num_documents is not None
+    assert all(
+        isinstance(layer.attention.inner_attention, UlyssesVarlenInnerAttention.Config)
+        for layer in config.model.layers
+    )
+    config.__post_init__()
+
+
+def test_per_group_accelerator_graph_integration_supports_fake_pg() -> None:
+    tests_by_name = {test.test_name: test for test in build_features_test_list()}
+    test = tests_by_name["fsdp_per_group_accelerator_graph"]
+    config = test.configs[0]()
+
+    assert test.configs == [muse_glimmer_debugmodel_fsdp2_per_group_accelerator_graph]
+    assert not test.use_real_pg
+    assert test.ngpu == 2
+    assert config.parallelism.data_parallel_shard_degree == 2
+    assert config.training.accelerator_graph_per_microbatch_group
+    assert config.training.steps == 10
+    assert config.training.num_tokens_per_train_step == (
+        3 * test.ngpu * config.training.num_tokens_per_microbatch_per_dp_rank
+    )
+
+
+def test_parse_multiple_integration_test_suites() -> None:
+    assert _parse_test_suites("features,models,h100,b200") == (
+        "features",
+        "models",
+        "h100",
+        "b200",
+    )
+
+
+def test_specialized_moe_backends_have_ep_coverage() -> None:
+    specialized_names = {
+        "fsdp+hybridep",
+        "qwen3_fsdp+deepep",
+    }
+    h100_model_tests = [
+        test for test in build_h100_tests_list() if test.test_name in specialized_names
+    ]
+
+    for test in h100_model_tests:
+        for config_fn in test.configs:
+            assert config_fn().parallelism.expert_parallel_degree > 1
+
+
+def test_models_select_fake_and_real_pg_cases() -> None:
+    model_tests = build_model_tests_list()
+    fake_pg_model_tests = {
+        test.test_name for test in model_tests if not test.use_real_pg
+    }
+    real_pg_model_tests = {test.test_name for test in model_tests if test.use_real_pg}
+
+    assert {
+        "deepseek_v3_fsdp+ep",
+        "qwen3_moe_fsdp+tp+cp+ep_param_groups",
+        "kimi_k2_5_muon_fsdp+ep",
+        "muse_glimmer_text_fsdp",
+        "muse_glimmer_mm_fsdp+tp+sp",
+    } <= fake_pg_model_tests
+    assert {
+        "deepseek_v3_fsdp+cp+pp+ep",
+        "deepseek_v4_fsdp+tp+ep+pp",
+    } <= real_pg_model_tests
+
+
+@pytest.mark.parametrize(
+    ("test_name", "incompatibility"),
+    [
+        ("checkpoint", "checkpointing"),
+        ("pipeline_parallel", "pipeline parallelism"),
+    ],
+)
+def test_fake_pg_incompatible_test_requires_explicit_marker(
+    test_name: str, incompatibility: str
+) -> None:
+    config = llama3_debugmodel(seq_len=2048)
+    if test_name == "checkpoint":
+        config.checkpointer = CheckpointManager.Config()
+    elif test_name == "pipeline_parallel":
+        config.parallelism.pipeline_parallel_degree = 2
+
+    test = IntegrationTestDefinition(configs=[llama3_debugmodel], test_name=test_name)
+
+    with pytest.raises(ValueError, match=incompatibility):
+        validate_fake_pg_compatibility(test, config)
+
+    test.use_real_pg = True
+    validate_fake_pg_compatibility(test, config)

@@ -1,0 +1,779 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import math
+import os
+import warnings
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from datetime import timedelta
+from typing import TYPE_CHECKING
+
+import torch
+import torch.cuda.nccl
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.config as dist_config
+import torch.distributed.distributed_c10d as c10d
+import torch.distributed.tensor._random
+import torch.distributed.tensor.parallel
+from torch import distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+
+from torchtitan.config import CommConfig, DebugConfig
+from torchtitan.distributed.parallelism_context import DistributedTopology, MeshAxisName
+from torchtitan.tools.utils import device_module, device_type, get_local_device
+
+logger = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:
+    from torchtitan.distributed.parallelism_context import ParallelismContext
+    from torchtitan.models.base.module import Module
+
+
+def get_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a DTensor's local shard without adding an autograd operation."""
+    return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
+
+
+def as_dtensor_like(param: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
+    """Wrap ``local`` as a DTensor with ``param``'s mesh, placements, and shape.
+
+    Returns ``local`` unchanged if ``param`` is not a DTensor. ``local`` must be
+    on ``param``'s device; ``DTensor.from_local`` copies it there otherwise.
+    ``run_check=False`` skips the cross-rank check of ``Replicate()`` placements,
+    so ``local`` must already match on every replica.
+    """
+    if not isinstance(param, DTensor):
+        return local
+    return DTensor.from_local(
+        local,
+        param.device_mesh,
+        param.placements,
+        run_check=False,
+        shape=param.shape,
+        stride=param.stride(),
+    )
+
+
+def _dist_reduce(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> float:
+    """Perform distributed reduction on a tensor.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        reduceOp (str): Reduce operation to perform.
+        mesh (DeviceMesh | None): Device mesh to use for reduction.
+            If None, no reduction is performed but simply convert the tensor to a float.
+        extra_pg (dist.ProcessGroup, optional): Extra process group to use for reduction.
+            Defaults to None. If provided, this all_reduce will be called for the extra
+            process group, and then the result will be all_reduced for the mesh.
+    """
+    return float(_dist_reduce_tensor(x, reduceOp, mesh, extra_pg).item())
+
+
+def _dist_reduce_tensor(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Perform a distributed reduction without moving the result to the CPU."""
+    needs_wait = False
+    if extra_pg is not None:
+        x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
+        needs_wait = True
+    if mesh is not None:
+        x = funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
+        needs_wait = True
+    return funcol.wait_tensor(x) if needs_wait else x
+
+
+# TODO: rename this to maybe_dist_max
+def dist_max(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> float:
+    return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_sum(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> float:
+    return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_mean(x: torch.Tensor, mesh: DeviceMesh) -> float:
+    """Average a scalar over the mesh.
+
+    Divides by the number of values the all-reduce summed, not by the mesh size.
+    A fake process group's all-reduce changes nothing, so this returns the local
+    value.
+    """
+    total, count = _dist_reduce_tensor(
+        torch.stack((x, torch.ones_like(x))),
+        reduceOp=c10d.ReduceOp.SUM.name,
+        mesh=mesh,
+        extra_pg=None,
+    ).tolist()
+    return total / count
+
+
+def dist_sum_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Sum a tensor across process groups and keep the result on its device."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def set_determinism(
+    parallelism_context: ParallelismContext,
+    device: torch.device,
+    debug_config: DebugConfig,
+    distinct_seed_mesh_axes: list[str],
+) -> None:
+    """
+    Set the same distributed RNG seed for all axes in the world mesh, but use
+    different seeds across axes named by ``distinct_seed_mesh_axes``. For
+    example, pipeline stages should use different seeds while ranks within an
+    SPMD group use the same seed.
+
+    This uses PyTorch's DTensor RNG tracker because it provides mesh-aware RNG
+    offsets for sharded parameter initialization.
+
+    Set Determinism flags for increased reproducibility with loss of performance.
+
+    Args:
+        parallelism_context: Parallelism context for distributed training.
+        device: Device to use
+        debug_config: Debug config to use
+        distinct_seed_mesh_axes: Mesh axis names that receive distinct seeds.
+    """
+    if debug_config.deterministic:
+        logger.info("Deterministic algorithm enabled (expect perf degradation).")
+        torch.use_deterministic_algorithms(
+            True, warn_only=debug_config.deterministic_warn_only
+        )
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # use_deterministic_algorithms(True) enables fill_uninitialized_memory,
+        # which makes torch.empty() run a fill kernel. This kernel races with
+        # DeepEP comm streams, causing errors.
+        # This also prevents HF modeling from initializing ROPE (inv_freq) buffers to NaN.
+        # pyrefly: ignore [missing-attribute]
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        # env var for deterministic CuBLAS
+        # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+        from torch.nn.attention.flex_attention import flex_attention
+
+        from torchtitan.models.common.attention import FlexInnerAttention
+
+        if torch.version.hip is not None:
+            # Compiled ROCm flex attention is not deterministic.
+            # Falling back to eager (non-compiled) flex_attention for determinism on ROCm.
+            logger.info(
+                "Using eager (non-compiled) flex_attention for determinism on ROCm."
+            )
+            FlexInnerAttention._compiled_flex_attn = flex_attention
+        else:
+            # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
+            # reproducibility, since the autotune results may not be deterministic. We disable
+            # autotune in-place on FlexInnerAttention.inductor_configs (rather than recompiling with
+            # no options) so the regional-inductor scoop configs are preserved.
+            FlexInnerAttention.inductor_configs["max_autotune"] = False
+            FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
+    if debug_config.detect_anomaly:
+        logger.warning(
+            "Anomaly detection enabled. This incurs significant overhead "
+            "and is for debugging only."
+        )
+        # check_nan=False disables the NaN/Inf gradient check that internally calls
+        # aten._is_any_true, which has no DTensor sharding strategy and would crash.
+        # Stack trace recording (the useful part) is still enabled.
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
+
+    seed = debug_config.seed
+    if parallelism_context.world_size == 1:
+        if seed is not None:
+            torch.manual_seed(seed)
+            os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
+            logger.debug(f"Single-process job using seed: {seed}")
+        return
+
+    # to ensure we can control which ranks have same or different seeds, all ranks agree on a starting seed.
+    # if user provides one, we use this. Otherwise rank 0 rolls the dice and everyone else uses that.
+    if seed is None:
+        # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
+        # seeds for unique SPMD groups
+        seed_tensor = torch.get_rng_state()[:8].to(device)
+        torch.distributed.broadcast(seed_tensor, src=0)
+        seed = seed_tensor.to("cpu").view(torch.uint64).item()
+    assert isinstance(seed, int)
+
+    # Set distinct seeds across the requested mesh axes.
+    # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
+    # and choose a unique seed for each rank on the PP mesh.
+    # We support multiple distinct dimensions by adding each distinct dimension's local rank to the seed.
+    distinct_seed_meshes = [
+        parallelism_context.get_optional_mesh(axis) for axis in distinct_seed_mesh_axes
+    ]
+    distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
+    assert all(mesh is not None for mesh in distinct_seed_meshes)
+
+    if distinct_seed_meshes:
+        # Each axis contributes: local_rank * (product of all previous axis sizes).
+        # This guarantees uniqueness like multi-dimensional array indexing
+        seed_offset = 0
+        cumulative_size = 1
+
+        for distinct_mesh in distinct_seed_meshes:
+            local_rank = distinct_mesh.get_local_rank()
+            # Add this axis's contribution.
+            seed_offset += local_rank * cumulative_size
+            # Update cumulative size for the next axis.
+            cumulative_size *= distinct_mesh.size()
+
+        seed += seed_offset
+        seed %= 2**64
+
+        logger.debug(
+            f"Distinct axes {distinct_seed_mesh_axes}, Global rank {c10d.get_rank()} using seed: {seed}"
+        )
+
+    else:
+        logger.debug(f"Global Rank {c10d.get_rank()} using seed: {seed}")
+
+    # The native RNGs and python RNG may not be important, except for the 1-D PP case, but we seed them for consistency.
+    torch.manual_seed(seed)
+    # PYTHONHASHSEED can be a decimal number in the range [0, 2**32 - 1]
+    os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
+
+    # As long as we are not in the 1-D (PP-only) case, we will have a seed to use for
+    # all ranks of the SPMD mesh. If PP is also used, this seed is unique per PP rank.
+    # TODO: remove the need of passing in a mesh once
+    # torch.distributed.tensor._random.manual_seed doesn't require a mesh input.
+    if parallelism_context.world_size > parallelism_context.pp:
+        # We just need to pass the world_mesh as the device_id is the only information
+        # this API uses.
+        torch.distributed.tensor._random.manual_seed(
+            seed, parallelism_context.world_mesh
+        )
+
+
+@contextlib.contextmanager
+def dtensor_rng_tracker_off(mesh: DeviceMesh) -> Iterator[None]:
+    """Run DTensor random ops on CPU-offloaded shards on the CPU generator.
+
+    Under FSDP CPU offload the parameters are DTensors on an accelerator mesh
+    whose local shards live on CPU. DTensor runs random ops on them inside its
+    RNG tracker's ``fork_rng``, which restores the CPU generator after each op,
+    so every draw repeats the previous one and rejection loops such as
+    ``trunc_normal_`` with +-3 std bounds never return. With the tracker off,
+    the ops advance the CPU generator, which ``set_determinism`` seeds per FSDP
+    shard because CPU offload requires ``dp_shard`` in
+    ``debug.distinct_seed_mesh_axes``.
+    """
+    # TODO: drop once DTensor's RNG supports CPU local shards:
+    # https://github.com/pytorch/pytorch/pull/196072
+    dtensor_random = torch.distributed.tensor._random
+    saved = dtensor_random._rng_tracker
+    # DTensor creates an enabled tracker on the first random op if none exists.
+    # The tracker only reads the mesh's device type.
+    tracker = saved or dtensor_random.OffsetBasedRNGTracker(mesh, run_state_sync=False)
+    enabled = tracker.distribute_region_enabled
+    dtensor_random._rng_tracker = tracker
+    tracker.distribute_region_enabled = False
+    try:
+        yield
+    finally:
+        tracker.distribute_region_enabled = enabled
+        dtensor_random._rng_tracker = saved
+
+
+def init_fake_mode(
+    world_size: int,
+    *,
+    rank: int = 0,
+) -> None:
+    """Initialize fake backend
+
+    Args:
+        world_size: The number of GPUs to simulate
+        rank: Global rank to simulate
+    """
+    torch.distributed.init_process_group(
+        "fake",
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+def _env_int(name: str, *, default: int | None = None) -> int:
+    """Read an integer environment variable with an actionable error."""
+    value = os.environ.get(name)
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{name} environment variable must be set")
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{name} environment variable must be a valid integer, got: {value}"
+        ) from error
+
+
+def _fake_logical_rank(logical_world_size: int, pp_degree: int) -> int:
+    """Resolve a pure-fake logical rank with SPMD coordinate zero."""
+    if logical_world_size % pp_degree != 0:
+        raise ValueError(
+            f"Logical world size {logical_world_size} must be divisible by PP "
+            f"degree {pp_degree}"
+        )
+    pp_rank = _env_int("FAKE_PP_RANK", default=0 if pp_degree == 1 else None)
+    spmd_world_size = logical_world_size // pp_degree
+    if not 0 <= pp_rank < pp_degree:
+        raise ValueError(f"FAKE_PP_RANK must be in [0, {pp_degree}), got {pp_rank}")
+    return pp_rank * spmd_world_size
+
+
+def _init_real_pp_fake_spmd(
+    logical_world_size: int,
+    pp_degree: int,
+    timeout: timedelta,
+) -> DistributedTopology:
+    """Initialize real PP communication inside a fake logical SPMD world."""
+    physical_world_size = _env_int("WORLD_SIZE")
+    physical_rank = _env_int("RANK")
+    if physical_world_size != pp_degree:
+        raise ValueError(
+            "real-PP/fake-SPMD mode requires one physical process per PP rank: "
+            f"WORLD_SIZE={physical_world_size}, PP={pp_degree}"
+        )
+    if not 0 <= physical_rank < physical_world_size:
+        raise ValueError(
+            f"RANK must be in [0, {physical_world_size}), got {physical_rank}"
+        )
+    if logical_world_size % pp_degree != 0:
+        raise ValueError(
+            f"Logical world size {logical_world_size} must be divisible by PP "
+            f"degree {pp_degree}"
+        )
+
+    if "FAKE_PP_RANK" in os.environ:
+        raise ValueError(
+            "FAKE_PP_RANK is invalid with the real_pp_fake_spmd backend; "
+            "physical RANK selects the PP coordinate"
+        )
+    spmd_world_size = logical_world_size // pp_degree
+    logical_rank = physical_rank * spmd_world_size
+    logical_pp_ranks = [pp_rank * spmd_world_size for pp_rank in range(pp_degree)]
+    init_fake_mode(logical_world_size, rank=logical_rank)
+
+    rendezvous = dist.rendezvous(
+        "env://",
+        rank=physical_rank,
+        world_size=physical_world_size,
+        timeout=timeout,
+    )
+    store, rendezvous_rank, rendezvous_world_size = next(rendezvous)
+    if (rendezvous_rank, rendezvous_world_size) != (
+        physical_rank,
+        physical_world_size,
+    ):
+        raise RuntimeError("Physical PP rendezvous returned inconsistent topology")
+
+    group_name = c10d.GroupName("torchtitan_real_pp")
+    pp_group, _ = c10d._new_process_group_helper(
+        group_size=physical_world_size,
+        group_rank=physical_rank,
+        global_ranks_in_group=logical_pp_ranks,
+        backend="nccl",
+        store=store,
+        group_name=group_name,
+        timeout=timeout,
+        pg_tag=group_name,
+        device_id=get_local_device(),
+        group_desc="TorchTitan real pipeline group",
+    )
+    if not isinstance(pp_group, dist.ProcessGroup):
+        raise RuntimeError("Failed to construct the real PP process group")
+    c10d._world.pg_group_ranks[pp_group] = {
+        logical_rank: group_rank
+        for group_rank, logical_rank in enumerate(logical_pp_ranks)
+    }
+    return DistributedTopology(
+        world_size=logical_world_size,
+        real_pp_group_for_fake_spmd=pp_group,
+    )
+
+
+def _warn_overwrite_env(name: str, value: str) -> None:
+    if name in os.environ:
+        logger.warning("%s=%s will be overridden to %s.", name, os.environ[name], value)
+    os.environ[name] = value
+
+
+def configure_nccl_for_ulysses(
+    model: Module.Config, *, device_type: str, comm_backend: str
+) -> None:
+    """Disable graph registration on affected NCCL versions before initialization.
+
+    NCCL < 2.32.3 can reuse partial IPC imports for Ulysses graph buffers.
+    Fix: https://github.com/NVIDIA/nccl/pull/2362 (NCCL 2.32.3).
+    """
+    if device_type != "cuda" or comm_backend in {"fake", "real_pp_fake_spmd"}:
+        return
+
+    from torchtitan.models.common.attention.cp_attention import Ulysses
+
+    # TODO: Remove this workaround once supported PyTorch builds ship
+    # NCCL >= 2.32.3.
+    if not dist.is_nccl_available() or torch.cuda.nccl.version() >= (2, 32, 3):
+        return
+
+    # We could only reproduce this issue with Ulysses. Always turning on
+    # this flag may have performance regressions.
+    if not any(model.traverse(Ulysses.Config)):
+        return
+
+    _warn_overwrite_env("NCCL_GRAPH_REGISTER", "0")
+    logger.info("Using NCCL_GRAPH_REGISTER=0 for Ulysses on NCCL before 2.32.3.")
+
+
+def build_alternative_fsdp_mesh(
+    storage_mesh: DeviceMesh,
+    *,
+    max_ctas: int,
+) -> DeviceMesh:
+    """Build a storage-shaped mesh with NCCL CTA-capped FSDP shard groups.
+
+    The ``dp_shard`` and ``edp_shard`` axes get resource-independent child
+    communicators. Other axis groups, rank order, and mesh shape stay unchanged.
+    Call collectively and reuse the result across buckets: each call creates
+    new communicators rather than looking them up in a persistent cache.
+
+    Requires NCCL on the FSDP shard axes; other backends raise ``ValueError``.
+    The fake backend preserves its groups, with a warning unless a group has one
+    rank. A mesh without FSDP shard axes is returned unchanged with a warning
+    that the cap is not applied.
+    """
+    mesh_axis_names = storage_mesh.mesh_dim_names
+    if mesh_axis_names is None:
+        raise ValueError("Redistribution storage mesh must have named axes")
+    fsdp_shard_axes = {
+        MeshAxisName.DP_SHARD.value,
+        MeshAxisName.EDP_SHARD.value,
+    }
+    if fsdp_shard_axes.isdisjoint(mesh_axis_names):
+        warnings.warn(
+            "The storage mesh has no FSDP shard axes; max_ctas will not be applied",
+            stacklevel=2,
+        )
+        return storage_mesh
+
+    groups = []
+    replaced_group = False
+    for axis_name in mesh_axis_names:
+        parent_group = storage_mesh.get_group(axis_name)
+        if axis_name not in fsdp_shard_axes:
+            groups.append(parent_group)
+            continue
+
+        backend = dist.get_backend(parent_group)
+        if backend == "fake":
+            # A one-rank group, such as a size-1 dp_shard or edp_shard, has
+            # nothing to cap.
+            if storage_mesh[axis_name].size() != 1:
+                warnings.warn(
+                    "Redistribution max_ctas is not modeled by the fake process "
+                    "group; using the storage-mesh process group",
+                    stacklevel=2,
+                )
+            groups.append(parent_group)
+            continue
+        if backend != dist.Backend.NCCL:
+            raise ValueError(
+                "Redistribution max_ctas requires an NCCL process group, "
+                f"got {backend!r} for mesh axis {axis_name!r}"
+            )
+
+        options = dist.ProcessGroupNCCL.Options()
+        options.config.max_ctas = max_ctas
+        # Keep redistribution channels independent from the FSDP parent.
+        options.config.split_share = 0  # pyrefly: ignore [missing-attribute]
+        num_ranks = dist.get_world_size(parent_group)
+        child_group = dist.split_group(
+            parent_pg=parent_group,
+            split_ranks=[list(range(num_ranks))],
+            pg_options=options,
+            group_desc=f"optimizer_redistribution_{axis_name}",
+            backend="nccl",
+        )
+        assert isinstance(child_group, dist.ProcessGroup)
+        groups.append(child_group)
+        replaced_group = True
+
+    return (
+        DeviceMesh.from_group(
+            groups,
+            storage_mesh.device_type,
+            mesh=storage_mesh.mesh,
+            mesh_dim_names=mesh_axis_names,
+        )
+        if replaced_group
+        else storage_mesh
+    )
+
+
+def init_distributed(
+    comm_config: CommConfig,
+    enable_cpu_backend: bool = False,
+    base_folder: str = "",
+    ranks: list[int] | None = None,
+    *,
+    pipeline_parallel_degree: int = 1,
+) -> DistributedTopology:
+    """Initialize communication and return the logical distributed topology."""
+    # Skip initialization if already initialized
+    if torch.distributed.is_initialized():
+        logger.warning(
+            "torch.distributed is already initialized. Skipping init_distributed. "
+            "The provided comm_config and other settings will not take effect."
+        )
+        return DistributedTopology(torch.distributed.get_world_size())
+
+    # Directed physical PP edges need independent, preinitialized communicator
+    # FIFOs so eager execution and CUDA graph replay use deterministic ordering.
+    # Older PyTorch versions do not expose this option.
+    # XCCL cannot split process groups for directed PP edges.
+    # TODO: upstream issue https://github.com/pytorch/pytorch/issues/186548 and
+    # https://github.com/intel/torch-xpu-ops/issues/5742
+    # Remove this gate once per-edge P2P supports XCCL.
+    backend = torch.distributed.Backend.default_device_backend_map.get(device_type)
+    use_per_edge_p2p = pipeline_parallel_degree > 1 and backend != "xccl"
+    if hasattr(dist_config, "pipeline_per_edge_p2p"):
+        setattr(dist_config, "pipeline_per_edge_p2p", use_per_edge_p2p)  # noqa: B010
+    elif use_per_edge_p2p:
+        raise RuntimeError(
+            "Pipeline parallelism requires a PyTorch version that provides "
+            "torch.distributed.distributed_c10d._config.pipeline_per_edge_p2p."
+        )
+
+    # disable autograd multithreading, to enable TLS DeviceMesh stack for spmd_types backend.
+    # this is needed for AC functionality; multi-threaded autograd means BWD threads performing recompute,
+    # cannot access PGs, e.g. current_spmd_mesh().get_group("tp") to perform the collectives they need.
+    torch.autograd.set_multithreading_enabled(False)
+
+    if comm_config.backend in {"fake", "real_pp_fake_spmd"}:
+        logical_world_size = _env_int("NGPU")
+        if comm_config.backend == "real_pp_fake_spmd":
+            return _init_real_pp_fake_spmd(
+                logical_world_size,
+                pipeline_parallel_degree,
+                timedelta(seconds=comm_config.init_timeout_seconds),
+            )
+        rank = _fake_logical_rank(logical_world_size, pipeline_parallel_degree)
+        if not 0 <= rank < logical_world_size:
+            raise ValueError(
+                f"Fake rank must be in [0, {logical_world_size}), got {rank}"
+            )
+        init_fake_mode(logical_world_size, rank=rank)
+        return DistributedTopology(logical_world_size)
+
+    def _get_distributed_backend(enable_cpu_backend):
+        backend = "nccl"
+        if device_type in torch.distributed.Backend.default_device_backend_map:
+            backend = torch.distributed.Backend.default_device_backend_map.get(
+                device_type
+            )
+        if enable_cpu_backend:
+            backend = f"{device_type}:{backend},cpu:gloo"
+        return backend
+
+    TRACE_BUFFER_SIZE = "TORCH_FR_BUFFER_SIZE"
+    TRACE_FILE = "TORCH_FR_DUMP_TEMP_FILE"
+    DUMP_ON_TIMEOUT = "TORCH_NCCL_DUMP_ON_TIMEOUT"
+    ASYNC_ERROR_HANDLING = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
+    SKIP_CLEANUP = "3"
+
+    # FlightRecorder is incompatible with =1 mode where watchdog aborts work, must use =3 (skipcleanup)
+    # to get flight recorder dumps. See https://github.com/pytorch/pytorch/issues/121055
+    # This could be done only when flight recorder is enabled, but its nice to be consistent to avoid subtle
+    # behavior differences
+    _warn_overwrite_env(ASYNC_ERROR_HANDLING, SKIP_CLEANUP)
+
+    # enable torch nccl flight recorder in the mode that would dump files if timeout is detected
+    _warn_overwrite_env(TRACE_BUFFER_SIZE, str(comm_config.trace_buf_size))
+    if comm_config.trace_buf_size > 0:
+        # dump on timeout by default if trace buffer is enabled
+        _warn_overwrite_env(DUMP_ON_TIMEOUT, "1")
+        dump_dir = os.path.join(base_folder, comm_config.save_traces_folder)
+        prefix = comm_config.save_traces_file_prefix
+        os.makedirs(dump_dir, exist_ok=True)
+        _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
+
+    torch.distributed.init_process_group(
+        backend=_get_distributed_backend(enable_cpu_backend),
+        timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        _ranks=ranks if ranks is not None else [],
+    )
+
+    return DistributedTopology(torch.distributed.get_world_size())
+
+
+def set_pg_timeouts(
+    timeout: timedelta,
+    parallelism_context: ParallelismContext,
+):
+    """
+    Sets the timeout for all PGs in the provided mesh, and the default (world) group.
+
+    Note: synchronizes via a barrier, before changing the timeouts. This is important, because
+    otherwise you may face a race where the slow rank has not reached the timeout reduction point
+    yet due to slow operations permitted under the old timeout value, but other faster ranks may
+    start issuing collectives under the new shorter timeout and then immediately timeout.
+    """
+    logger.info(
+        f"Synchronizing and adjusting timeout for all ProcessGroups to {timeout}"
+    )
+    # Ensure that all the ranks have reached the point of setting the new timeout-
+    # otherwise, some ranks may issue collectives with the new/shorter timeout and
+    # those may time out, before other ranks have finished with initialization done
+    # under the old/slow timeout.
+    torch.distributed.barrier(device_ids=[device_module.current_device()])
+    device_module.synchronize()
+
+    # None represents the 'default' PG, not part of the mesh
+    groups: list[torch.distributed.ProcessGroup | None] = [
+        mesh.get_group()
+        for mesh in parallelism_context.get_all_one_dimensional_meshes().values()
+    ] + [None]
+    for group in groups:
+        torch.distributed.set_timeout(timeout, group)
+
+
+@torch.no_grad()
+def clip_grad_norm_(
+    parameters: torch.Tensor | Iterable[torch.Tensor],
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    pp_mesh: DeviceMesh | None = None,
+) -> torch.Tensor:
+    """
+    Clip the gradient norm of an iterable of parameters.
+
+    Gradient norm clipping requires computing the gradient norm over the entire model.
+    `torch.nn.utils.clip_grad_norm_` only computes gradient norm along DP/FSDP/TP dimensions.
+    We need to manually reduce the gradient norm across PP stages.
+    See https://github.com/pytorch/torchtitan/issues/596 for details.
+
+    Gradients are not always on the same DTensor mesh. For example:
+    - With EP, routed experts use the sparse mesh while all other parameters
+      use the dense mesh.
+    - With CP, the decoder is FSDP-sharded over dp_shard and cp. The vision
+      encoder is much smaller, so we deliberately do not apply CP to it and
+      shard it over dp_shard only. The two therefore use different meshes.
+    We compute the norm for each mesh separately, then combine them into
+    one total norm.
+
+    Args:
+        parameters: an iterable of Tensors or a single Tensor that will have gradients normalized
+        max_norm (float): max norm of the gradients
+        norm_type (float): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+        error_if_nonfinite (bool): if True, an error is thrown if the total
+            norm of the gradients from :attr:`parameters` is ``nan``,
+            ``inf``, or ``-inf``. Default: False (will switch to True in the future)
+        foreach (bool): use the faster foreach-based implementation.
+            If ``None``, use the foreach implementation for CUDA and CPU native tensors and silently
+            fall back to the slow implementation for other device types.
+            Default: ``None``
+        pp_mesh: Pipeline Parallel device mesh. If not None, will reduce gradient norm across PP stages.
+
+    Returns:
+        Total norm of the parameter gradients (viewed as a single vector).
+
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+
+    # get_total_norm stacks per-parameter norms, so all gradients passed to it
+    # must be on the same mesh. Meshes can differ even over the same devices:
+    # FSDP over dp_shard and cp gives a (dp_shard_cp, tp) mesh, while FSDP
+    # over dp_shard alone keeps (dp_shard, cp, tp). So group gradients by mesh.
+    params_by_mesh: dict[DeviceMesh | None, list[torch.Tensor]] = defaultdict(list)
+    for p in parameters:
+        if p.grad is not None:
+            mesh = p.grad.device_mesh if isinstance(p.grad, DTensor) else None
+            params_by_mesh[mesh].append(p)
+
+    norms = []
+    # An empty list yields tensor(0.), e.g. on a PP rank without gradients.
+    for params in params_by_mesh.values() or [[]]:
+        norm = torch.nn.utils.get_total_norm(
+            [p.grad for p in params if p.grad is not None],
+            norm_type,
+            error_if_nonfinite,
+            foreach,
+        )
+        # If norm is a DTensor, the placements must be
+        # `torch.distributed._tensor.ops.math_ops._NormPartial`. We can simply
+        # reduce the DTensor to get the norm in this tensor's process group
+        # and then convert it to a local tensor.
+        # NOTE: It has two purposes:
+        #       1. to make sure the total norm is computed correctly when PP
+        #          is used (see below)
+        #       2. to return a reduced total_norm tensor whose .item() would
+        #          return the correct value
+        if isinstance(norm, DTensor):
+            # Will reach here if any non-PP parallelism is used.
+            # If only using PP, norm will be a local tensor.
+            norm = norm.full_tensor()
+        norms.append(norm)
+
+    if len(norms) == 1:
+        total_norm = norms[0]
+    elif math.isinf(norm_type):
+        total_norm = torch.stack(norms).amax()
+    else:
+        total_norm = sum(norm**norm_type for norm in norms) ** (1.0 / norm_type)
+
+    if pp_mesh is not None:
+        if math.isinf(norm_type):
+            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+        else:
+            total_norm **= norm_type
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
+            total_norm **= 1.0 / norm_type
+
+    for params in params_by_mesh.values():
+        torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach)
+    return total_norm
